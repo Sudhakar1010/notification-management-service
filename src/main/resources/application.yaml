@@ -1,3 +1,35 @@
 spring:
   application:
     name: notification-management-service
+
+  datasource:
+    url: jdbc:h2:mem:notifications;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+    defer-datasource-initialization: true
+
+  sql:
+    init:
+      mode: always
+
+notification:
+  delivery:
+    poll-interval-ms: 2000
+
+logging:
+  level:
+    com.nms: DEBUG
