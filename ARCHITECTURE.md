@@ -850,6 +850,50 @@ without time pressure) — it just isn't live today.
   is a small, well-understood follow-up — just not one to attempt for the
   first time with no remaining margin for a second surprise.
 
+### ADR-020 — Generated OpenAPI/Swagger contract via springdoc
+**Status:** Accepted
+
+**Context:** The API Reference in `README.md` was hand-written and could
+silently drift from the actual controller contract (§7, Medium).
+
+**Decision:** Added `springdoc-openapi-starter-webmvc-ui` (`3.1.1` — the
+line built against Spring Framework 7 / Boot 4, not the `2.x` line built
+for Boot 3). It introspects the existing `@RestController` methods, DTO
+records, and Bean Validation annotations directly — no parallel contract
+file to keep in sync. `OpenApiConfig` adds only what can't be inferred:
+title/description/version, and an `X-Api-Key` security scheme (documented
+unconditionally, since a deployment may turn ADR-018's auth on even though
+it's off by default here). `NotificationController`'s three endpoints got
+`@Operation`/`@ApiResponses` annotations for response-code documentation
+that isn't otherwise derivable from the method signature (e.g. *why* a
+`403` can happen).
+
+**Alternatives considered:**
+- *Hand-maintained OpenAPI YAML* — rejected: reintroduces the exact
+  drift risk this closes; two sources of truth for the same contract.
+- *Contract-first (design the YAML, generate the controller)* — rejected
+  as a bigger restructure than this gap warrants; the controllers already
+  exist and are stable.
+
+**Consequences:**
+- \+ `/v3/api-docs` and `/swagger-ui/index.html` are always current with
+  the actual code — verified live (both return `200`, and the generated
+  path list matches the controllers exactly).
+- \+ Closes a Medium backlog item with a single dependency and a small
+  config class — no hand-authored contract to maintain.
+- − Generated descriptions are only as good as the annotations behind
+  them; the six-way `RecipientId` failure-marker table and the webhook
+  HTTP-status-classification table in `README.md` are domain knowledge
+  springdoc can't infer, so that narrative reference stays alongside the
+  generated contract rather than being replaced by it.
+- − `springdoc-openapi-starter-webmvc-ui` pulls in Swagger UI's static
+  assets into the running app; harmless at prototype scale, but a real
+  deployment typically disables it in production profiles
+  (`springdoc.swagger-ui.enabled=false`) and keeps only `/v3/api-docs` for
+  tooling, or gates both behind the same auth as the API itself.
+
+---
+
 ## 5. Three Scenarios: Decomposition, Execution, Validation
 
 How each of the assignment's three required scenarios was broken down,
@@ -1071,7 +1115,7 @@ what closing it would look like.
 
 | Gap | Why it matters | Close it by |
 |---|---|---|
-| No OpenAPI/Swagger contract | The API reference in `README.md` is hand-written and not guaranteed to match the code | Add `springdoc-openapi-starter-webmvc-ui` |
+| ~~No OpenAPI/Swagger contract~~ | **Closed — ADR-020.** `springdoc-openapi-starter-webmvc-ui` generates `/v3/api-docs` and `/swagger-ui/index.html` from the controllers directly. | Before production: disable Swagger UI's static assets (`springdoc.swagger-ui.enabled=false`) or gate both endpoints behind ADR-018's auth — open by default today, same as the rest of the API. |
 | Blanket `DEBUG` logging for the whole package | A production profile should default narrower | Add a `prod` profile with `INFO` as the package default |
 | No concurrency test proving either optimistic-lock claim | See §6 | Add tests that fire two concurrent claims at the same row and assert exactly one wins |
 
@@ -1079,3 +1123,113 @@ what closing it would look like.
 
 - **No secrets management story** — moot today (providers are mocked/local), but a real credential shouldn't live in `application.yaml`.
 - **No CORS/CSRF posture defined** — no Spring Security dependency at all, so this is "wide open by omission," to be decided alongside authentication.
+
+## 8. Cloud & Production Infrastructure Roadmap
+
+A principal-level review of what this prototype would need to swap in, not
+build from scratch, to run as a real cloud service — organized by which
+architectural seam absorbs the change. The seams already exist
+(`DeliveryQueue`, `ChannelProvider`, `DeliveryWorker`) specifically so this
+list is a set of substitutions, not rewrites.
+
+### 8.1 Async communication — replacing the DB-backed outbox
+
+The outbox pattern (ADR-002) was the right call with zero infrastructure
+available, but it's the single biggest thing standing between this
+prototype and production throughput. The `DeliveryQueue` port
+(`enqueue(...)`) and `ChannelProvider` interface are the exact seams a real
+broker plugs into — neither `NotificationService` nor the providers would
+change.
+
+| Option | Fit here | Trade-off |
+|---|---|---|
+| **Amazon SQS (+ SNS fan-out)** | Best fit if already on AWS. `DeliveryQueue.enqueue()` becomes `sqsClient.sendMessage(...)`; a `@SqsListener` (Spring Cloud AWS) replaces `DeliveryWorker`'s poll loop. Standard queues need the existing `(notificationId, recipientId, channel)` unique constraint kept as an idempotency backstop (SQS standard queues allow at-least-once/duplicate delivery); FIFO queues add per-group ordering at lower throughput if strict per-recipient ordering is ever required. | Managed, no cluster to run; per-request pricing; DLQ built in (maps directly onto today's `EXHAUSTED` status). |
+| **Kafka (MSK/Confluent Cloud)** | Overkill unless notification volume is high enough to want partitioned, replayable, multi-consumer-group processing (e.g. a separate analytics consumer reading the same delivery-attempt stream). Partition key = `recipientId` or `notificationId` to preserve per-recipient ordering. | Highest operational ceiling, highest operational cost; a cluster (even managed) is real infrastructure to run, monitor, and version schemas for (Avro/Schema Registry). |
+| **RabbitMQ (Amazon MQ / CloudAMQP)** | Middle ground — real broker semantics (routing, DLQ, priority queues) without Kafka's operational weight. Priority queues are a natural home for the currently-unused `priority` field (§ Limitations) once there's a real decision to route `URGENT` ahead of `LOW` in the queue itself. | Less horizontally scalable than Kafka/SQS at extreme volume; still a stateful broker to operate unless using a managed tier. |
+| **Google Pub/Sub / Azure Service Bus** | Direct analogues to SQS/SNS on the other two clouds — same shape of change if the deployment target is GCP/Azure instead of AWS. | Cloud-locked, same as the SQS option. |
+
+**Recommendation:** SQS (or the equivalent managed queue on whichever
+cloud is the actual target) — it's the smallest infrastructure jump from
+"DB row" that gets a real push-based, horizontally-scalable consumer, and
+its at-least-once delivery model is already exactly what this system's
+two-tier idempotency (ADR-003) and delivery-level unique constraint were
+built to tolerate. Keep the `DeliveryAttempt` table too — not as the
+queue, but as the durable audit/status projection `GET
+/notifications/{id}` already reads from; the queue becomes the trigger,
+the table stays the source of truth for status.
+
+### 8.2 Scheduling — replacing the single-node `@Scheduled` poller
+
+`DeliveryWorker`'s `fixedDelay` poll (ADR-002) only ever runs on one JVM
+today; running two instances would double-process the same due rows
+(mitigated, not prevented, by the optimistic lock — it'd mean wasted work,
+not incorrect state, but it's still wrong to run this way on purpose).
+
+| Option | What it solves | Notes |
+|---|---|---|
+| **Move to 8.1's message consumer** | Eliminates the polling problem entirely — a queue consumer scales horizontally by adding consumers, no coordination needed. | The real fix; makes this whole section mostly moot for the delivery loop specifically. |
+| **ShedLock / db-scheduler** | If a DB-backed scheduled job is kept for something else (e.g. an idempotency-key TTL sweep, §8.4), these libraries take a DB or Redis lock so only one instance's tick actually runs. | Lightweight, no new infrastructure — reuses the existing datasource. |
+| **Quartz clustered mode** | Full-featured cron/trigger persistence with clustering built in. | Heavier than this system needs today — its extra features (misfire policies, job persistence UI) aren't gaps this system currently has. |
+| **Kubernetes CronJob / AWS EventBridge Scheduler** | For genuinely periodic, stateless jobs (e.g. a nightly idempotency-key archival job, §8.4) that don't need to live inside the app process at all. | Decouples the job's lifecycle from the app's deploy lifecycle — can run even if the app is scaled to zero. |
+
+**Recommendation:** retire `DeliveryWorker` as a poller once 8.1 lands (a
+queue consumer replaces it directly); keep a small ShedLock-guarded
+`@Scheduled` job only for the genuinely periodic housekeeping task this
+system doesn't have yet — idempotency-key/audit retention (§8.4) — since
+that one is a better fit for "runs occasionally, doesn't need a queue."
+
+### 8.3 Compute & deployment
+
+| Gap | Cloud-native replacement |
+|---|---|
+| No containerization | `spring-boot-maven-plugin`'s built-in `build-image` goal (Cloud Native Buildpacks) — no separate Dockerfile needed for a straightforward Spring Boot app. |
+| No orchestration | Kubernetes (EKS/GKE/AKS) Deployment + HPA for the API pods; a separate Deployment (or the queue-consumer approach in 8.1) for delivery processing so the two scale independently — the API is request-bound, delivery is throughput-bound. |
+| No IaC | Terraform (or CDK if staying AWS-native) for the DB, queue, secrets store, and observability backend — all four are named below and currently exist only as "would need this in production" prose. |
+| No CI/CD pipeline | GitHub Actions running `./mvnw test`, then the buildpack image push, then a deploy step — straightforward given the test suite already exists and is green. |
+
+### 8.4 Data layer
+
+| Gap | Cloud-native replacement | Why |
+|---|---|---|
+| H2 in-memory, resets on restart | Amazon RDS/Aurora PostgreSQL (or Cloud SQL) | Durable, and PostgreSQL's real `SELECT ... FOR UPDATE SKIP LOCKED` support is directly relevant if a DB-polling pattern is ever kept anywhere (ADR-002's own noted follow-up). |
+| Unbounded idempotency-key retention (ADR-003, §6) | A scheduled archival/delete job (ShedLock-guarded, §8.2) moving `Notification`/`DeliveryAttempt` rows past a retention window (e.g. 30 days) to cold storage (S3 + Athena) before deleting | Keeps the hot table small; satisfies the "documented retention policy" requirement (4.4) with an actual mechanism, not just documentation. |
+| No read/write scaling story | A read replica for `GET /notifications/{id}`/`/audit` once read volume matters | Both are already pure reads with no write-path dependency. |
+
+### 8.5 Caching & rate limiting
+
+- **Redis (ElastiCache/MemoryStore)** for the idempotency lookup (`(sourceSystem, idempotencyKey)` → notification id) once traffic is high enough that the unique-index DB round-trip on every submission becomes a bottleneck — cache-aside in front of the same DB table, not a replacement for the DB constraint (which stays the actual correctness guarantee).
+- **Redis or an API gateway's built-in throttling** for per-`sourceSystem` rate limiting on `POST /notifications` — doesn't exist today; any authenticated (ADR-018) caller can currently submit unboundedly.
+
+### 8.6 Identity, auth, and the API surface
+
+- **Replace/extend `ApiKeyAuthenticationFilter` (ADR-018) with Spring Security + OAuth2 resource server**, validating JWTs issued by a real IdP (AWS Cognito, Okta, Auth0, or an internal one) — gets scopes/claims for free, which is exactly what the still-unbuilt authorization layer (§7) needs ("which systems may declare `CRITICAL`" maps naturally to a JWT scope check).
+- **API Gateway (AWS API Gateway / Kong / Apigee)** in front of the service for TLS termination, request throttling, and API-key issuance/rotation as a managed concern instead of the current plaintext `application.yaml` map.
+- **Secrets Manager / Vault / Kubernetes Secrets** for the API keys and DB credentials currently in `application.yaml` — direct fix for the Low-priority "no secrets management story" item already named in §7.
+
+### 8.7 Observability backend
+
+ADR-017's `LoggingSpanExporter` was the right call for a zero-infrastructure
+prototype; the swap is deliberately a one-bean change:
+
+- **Traces:** OTLP exporter → Grafana Tempo, AWS X-Ray, Datadog, or Honeycomb. Sampling should drop from today's `probability: 1.0` to a real fraction (e.g. 5–10% plus always-sample-on-error) once traffic isn't prototype-scale.
+- **Metrics:** Micrometer already instruments the app (Actuator's `/actuator/metrics`); point a `micrometer-registry-*` (Prometheus, CloudWatch, Datadog) at it instead of scraping the local endpoint by hand.
+- **Logs:** structured JSON logging (`logstash-logback-encoder` or Boot's own structured logging support) shipped to CloudWatch Logs/Loki/ELK — today's plain-text `DEBUG` logging (§7, Medium) doesn't aggregate well at scale.
+
+### 8.8 Real channel providers
+
+Directly replacing ADR-007's simulated Email/SMS: Amazon SES (email),
+Amazon SNS or Twilio (SMS) — both slot into the existing `ChannelProvider`
+interface with no change to `DeliveryAttemptProcessor`, `RoutingService`,
+or the retry/circuit-breaker machinery (ADR-011, ADR-016), which were
+deliberately built provider-agnostic from Phase 1 onward.
+
+### Summary — what changes and what doesn't
+
+The point of this section is that none of it requires re-architecting the
+application: `DeliveryQueue`, `ChannelProvider`, the derived-status model
+(ADR-004), and the two-tier idempotency boundary (ADR-003) were built as
+the seams that absorb exactly these swaps. What's listed above is
+substitution work — swap the outbox for a managed queue, swap H2 for a
+managed Postgres, swap the logging exporter for a real backend, swap the
+API-key map for a real IdP — not a rewrite of the notification, routing,
+or delivery logic itself.

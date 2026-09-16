@@ -6,7 +6,9 @@ asynchronously, and exposes status and audit history.
 
 **Documentation:** see [ARCHITECTURE.md](ARCHITECTURE.md) for design
 rationale (ADRs), the scenario walkthrough, testing approach/limitations/
-trade-offs, and the Production Readiness Backlog.
+trade-offs, the Production Readiness Backlog, and a Cloud & Production
+Infrastructure Roadmap (§8) covering what a real deployment would swap in
+(managed queue, managed DB, real IdP, observability backend, etc.).
 
 ## Tech Stack
 
@@ -15,6 +17,7 @@ trade-offs, and the Production Readiness Backlog.
 - Resilience4j (circuit breaker + retry, webhook channel only)
 - Micrometer Tracing + OpenTelemetry (logging exporter — no collector required)
 - Flyway (baseline migration present, currently shipped disabled — see ARCHITECTURE.md ADR-019)
+- springdoc-openapi (Swagger UI, generated from the controllers)
 - H2 in-memory database
 - Lombok
 - Maven Wrapper
@@ -89,6 +92,10 @@ management:
 
 **H2 console:** `http://localhost:8080/h2-console` — JDBC URL
 `jdbc:h2:mem:notifications`, user `sa`, empty password.
+
+**API docs (Swagger UI):** `http://localhost:8080/swagger-ui/index.html`
+(raw OpenAPI JSON at `/v3/api-docs`) — generated from the controllers, so it
+can't drift from the code the way the hand-written reference below can.
 
 **Actuator:** `/actuator/health` (H2 check + liveness/readiness),
 `/actuator/info`, `/actuator/metrics`.
