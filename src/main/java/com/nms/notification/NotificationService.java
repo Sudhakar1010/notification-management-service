@@ -7,6 +7,7 @@ import com.nms.common.NotificationStatus;
 import com.nms.delivery.DeliveryAttempt;
 import com.nms.delivery.DeliveryAttemptRepository;
 import com.nms.delivery.DeliveryQueue;
+import com.nms.exception.IdempotencyKeyConflictException;
 import com.nms.exception.InvalidNotificationRequestException;
 import com.nms.exception.NotificationNotFoundException;
 import com.nms.notification.dto.AuditEventView;
@@ -17,13 +18,18 @@ import com.nms.notification.dto.NotificationStatusResponse;
 import com.nms.notification.dto.RecipientDeliveryView;
 import com.nms.routing.RoutingDecision;
 import com.nms.routing.RoutingService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -31,6 +37,8 @@ import com.nms.audit.AuditEventRepository;
 
 @Service
 public class NotificationService {
+
+    private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
 
     private final NotificationRepository notificationRepository;
     // Read side: querying delivery attempts to project a status view is a
@@ -70,14 +78,38 @@ public class NotificationService {
     private void validate(NotificationRequest request) {
         if (request.expiresAt() != null && request.scheduledAt() != null
                 && !request.expiresAt().isAfter(request.scheduledAt())) {
-            throw new InvalidNotificationRequestException("expiresAt must be after scheduledAt");
+            rejectAndThrow(request, "expiresAt must be after scheduledAt");
         }
         if (request.expiresAt() != null && request.expiresAt().isBefore(Instant.now())) {
-            throw new InvalidNotificationRequestException("expiresAt must be in the future");
+            rejectAndThrow(request, "expiresAt must be in the future");
+        }
+
+        Set<String> seenRecipients = new HashSet<>();
+        for (var recipient : request.recipients()) {
+            if (!seenRecipients.add(recipient.recipientId())) {
+                rejectAndThrow(request, "duplicate recipientId in request: " + recipient.recipientId());
+            }
         }
     }
 
+    private void rejectAndThrow(NotificationRequest request, String reason) {
+        auditService.recordIndependently(null, AuditEventType.NOTIFICATION_REJECTED,
+                "sourceSystem=%s, idempotencyKey=%s, reason=%s"
+                        .formatted(request.sourceSystem(), request.idempotencyKey(), reason));
+        throw new InvalidNotificationRequestException(reason);
+    }
+
     private NotificationResponse replayDuplicate(Notification existing, NotificationRequest request) {
+        String incomingFingerprint = RequestFingerprint.of(request);
+        if (!incomingFingerprint.equals(existing.getRequestFingerprint())) {
+            auditService.recordIndependently(existing.getId(), AuditEventType.IDEMPOTENCY_KEY_CONFLICT,
+                    "idempotencyKey=%s reused by sourceSystem=%s with a different payload than the original submission"
+                            .formatted(request.idempotencyKey(), request.sourceSystem()));
+            throw new IdempotencyKeyConflictException(
+                    "idempotencyKey '%s' was already used by sourceSystem '%s' with a different request payload"
+                            .formatted(request.idempotencyKey(), request.sourceSystem()));
+        }
+
         auditService.record(existing.getId(), AuditEventType.NOTIFICATION_DEDUPLICATED,
                 "idempotencyKey=%s reused by sourceSystem=%s; no new notification created"
                         .formatted(request.idempotencyKey(), request.sourceSystem()));
@@ -89,6 +121,7 @@ public class NotificationService {
         notification.setSourceSystem(request.sourceSystem());
         notification.setEventId(request.eventId());
         notification.setIdempotencyKey(request.idempotencyKey());
+        notification.setRequestFingerprint(RequestFingerprint.of(request));
         notification.setNotificationType(request.notificationType());
         notification.setSeverity(request.severity());
         notification.setPriority(request.priority());
@@ -150,7 +183,16 @@ public class NotificationService {
         if (overallStatus != notification.getStatus()) {
             notification.setStatus(overallStatus);
             notification.setUpdatedAt(Instant.now());
-            notificationRepository.save(notification);
+            // This is an opportunistic refresh (ADR-004), not the source of truth for the
+            // response below -- if a concurrent GET for the same notification already wrote
+            // the same (or a newer) status, losing this optimistic-lock race is fine to ignore.
+            // saveAndFlush forces the version check to happen here, inside the try, rather than
+            // silently at commit time after this method has already returned.
+            try {
+                notificationRepository.saveAndFlush(notification);
+            } catch (ObjectOptimisticLockingFailureException e) {
+                log.debug("Notification {} status was already refreshed concurrently, skipping", notificationId);
+            }
         }
 
         List<RecipientDeliveryView> recipientViews = notification.getRecipients().stream()
@@ -165,8 +207,13 @@ public class NotificationService {
                 })
                 .toList();
 
+        List<Channel> selectedChannels = attempts.stream()
+                .map(DeliveryAttempt::getChannel)
+                .distinct()
+                .toList();
+
         return new NotificationStatusResponse(notification.getId(), overallStatus, notification.getRequestedChannels(),
-                recipientViews, notification.getCreatedAt(), notification.getUpdatedAt());
+                selectedChannels, recipientViews, notification.getCreatedAt(), notification.getUpdatedAt());
     }
 
     @Transactional(readOnly = true)

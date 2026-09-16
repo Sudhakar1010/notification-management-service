@@ -18,6 +18,12 @@ import java.util.UUID;
  * (e.g. "requested=[EMAIL], selected=[EMAIL]") -- never the notification
  * message body, recipient PII beyond the opaque recipientId already used
  * elsewhere, or provider credentials. See requirement 4.9.
+ *
+ * `notificationId` is nullable: a NOTIFICATION_REJECTED event fires when a
+ * request fails validation before a Notification row (and its id) exists
+ * at all, so there is nothing to attach it to. These rows are recorded for
+ * completeness but are not retrievable via the per-notification audit
+ * endpoint, since by definition no notification was ever created.
  */
 @Entity
 @Table(name = "audit_event")
@@ -28,7 +34,7 @@ public class AuditEvent {
     @Id
     private UUID id = UUID.randomUUID();
 
-    @Column(name = "notification_id", nullable = false)
+    @Column(name = "notification_id")
     private UUID notificationId;
 
     @Enumerated(EnumType.STRING)

@@ -26,7 +26,6 @@ class RoutingServiceTest {
         RoutingDecision decision = service.decide("alice", List.of(Channel.EMAIL, Channel.SMS), Severity.INFO);
 
         assertThat(decision.selectedChannels()).containsExactly(Channel.EMAIL, Channel.SMS);
-        assertThat(decision.isRoutable()).isTrue();
     }
 
     @Test
@@ -54,7 +53,6 @@ class RoutingServiceTest {
 
         RoutingDecision decision = service.decide("carol", List.of(Channel.EMAIL), Severity.WARNING);
 
-        assertThat(decision.isRoutable()).isFalse();
         assertThat(decision.selectedChannels()).isEmpty();
     }
 

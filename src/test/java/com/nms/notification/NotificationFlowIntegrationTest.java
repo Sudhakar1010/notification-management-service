@@ -4,16 +4,16 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
-import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.ObjectMapper;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 import java.time.Instant;
 
+import static com.nms.testsupport.NotificationApiTestHelper.pollUntilTerminal;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -58,7 +58,7 @@ class NotificationFlowIntegrationTest {
         assertThat(submitJson.get("status").asString()).isEqualTo("ROUTED");
         String notificationId = submitJson.get("notificationId").asString();
 
-        JsonNode statusJson = pollUntilTerminal(notificationId);
+        JsonNode statusJson = pollUntilTerminal(mockMvc, objectMapper, notificationId, Duration.ofSeconds(5));
 
         assertThat(statusJson.get("overallStatus").asString()).isEqualTo("DELIVERED");
         assertThat(statusJson.get("recipients").get(0).get("channels").get(0).get("status").asString())
@@ -96,21 +96,5 @@ class NotificationFlowIntegrationTest {
 
         assertThat(secondJson.get("duplicate").asBoolean()).isTrue();
         assertThat(secondJson.get("notificationId").asString()).isEqualTo(firstId);
-    }
-
-    private JsonNode pollUntilTerminal(String notificationId) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        JsonNode last = null;
-        while (Instant.now().isBefore(deadline)) {
-            String response = mockMvc.perform(get("/api/v1/notifications/" + notificationId))
-                    .andExpect(status().isOk())
-                    .andReturn().getResponse().getContentAsString();
-            last = objectMapper.readTree(response);
-            if (!last.get("overallStatus").asString().equals("PROCESSING")) {
-                return last;
-            }
-            Thread.sleep(150);
-        }
-        return last;
     }
 }

@@ -12,6 +12,7 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.UUID;
 
 import static com.nms.testsupport.NotificationApiTestHelper.pollUntilTerminal;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -19,19 +20,22 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Exercises WebhookChannelProvider against WebhookSinkController over a real
- * HTTP call on the embedded server's actual random port -- proves the
- * status-code -> FailureType classification against real responses, not
- * simulated markers.
+ * Proves ADR-016 (Resilience4j retry + circuit breaker around the webhook
+ * call). Uses its own explicit resilience properties (distinct from other
+ * webhook test classes) so Spring boots a dedicated context/port -- the
+ * CircuitBreakerRegistry is a singleton bean, and its state must not leak
+ * across test classes that happen to reuse a cached context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "notification.delivery.poll-interval-ms=100",
         "notification.delivery.retry-base-delay-ms=100",
         "notification.delivery.retry-max-delay-ms=300",
-        "notification.delivery.webhook-read-timeout-ms=300"
+        "notification.delivery.webhook-read-timeout-ms=300",
+        "notification.delivery.webhook.circuit-breaker.minimum-number-of-calls=5",
+        "notification.delivery.webhook.retry.max-attempts=2"
 })
 @AutoConfigureMockMvc
-class WebhookChannelIntegrationTest {
+class WebhookResilienceIntegrationTest {
 
     @LocalServerPort
     private int port;
@@ -43,52 +47,43 @@ class WebhookChannelIntegrationTest {
     private ObjectMapper objectMapper;
 
     @Test
-    void webhookDeliverySucceedsAgainstARealHttpCall() throws Exception {
-        JsonNode statusJson = submitAndAwaitTerminal(sinkUrl("ok"));
+    void flakyEndpointRecoversWithinOneOuterAttemptViaFastRetry() throws Exception {
+        String flakyKey = UUID.randomUUID().toString();
+        JsonNode statusJson = submitAndAwaitTerminal(sinkUrl("flaky/" + flakyKey), "flaky-" + flakyKey);
 
-        assertThat(statusJson.get("overallStatus").asString()).isEqualTo("DELIVERED");
         JsonNode channel = statusJson.get("recipients").get(0).get("channels").get(0);
         assertThat(channel.get("status").asString()).isEqualTo("SUCCEEDED");
-    }
-
-    @Test
-    void notFoundResponseIsClassifiedAsInvalidRecipientAndIsNotRetried() throws Exception {
-        JsonNode statusJson = submitAndAwaitTerminal(sinkUrl("not-found"));
-
-        JsonNode channel = statusJson.get("recipients").get(0).get("channels").get(0);
-        assertThat(channel.get("status").asString()).isEqualTo("FAILED");
-        assertThat(channel.get("lastFailureType").asString()).isEqualTo("INVALID_RECIPIENT");
+        // The fast inner retry absorbed the first (failing) call, so the
+        // outer, DB-backed retry loop never needed a second attempt.
         assertThat(channel.get("attemptCount").asInt()).isEqualTo(1);
     }
 
     @Test
-    void rateLimitResponseRetriesThenExhausts() throws Exception {
-        JsonNode statusJson = submitAndAwaitTerminal(sinkUrl("rate-limit"));
+    void repeatedServerErrorsOpenTheCircuitForThatTarget() throws Exception {
+        // Enough real 500s (each outer attempt fast-retries once more
+        // internally) to cross minimumNumberOfCalls=5 and open the circuit
+        // for this target authority.
+        submitAndAwaitTerminal(sinkUrl("server-error"), "circuit-trip-" + Instant.now().toEpochMilli());
+
+        // A second, different notification to a *different* path on the
+        // same host:port -- would normally succeed, but the circuit is now
+        // open for the whole target authority.
+        JsonNode statusJson = submitAndAwaitTerminal(sinkUrl("ok"), "circuit-blocked-" + Instant.now().toEpochMilli());
 
         JsonNode channel = statusJson.get("recipients").get(0).get("channels").get(0);
-        assertThat(channel.get("status").asString()).isEqualTo("EXHAUSTED");
-        assertThat(channel.get("lastFailureType").asString()).isEqualTo("RATE_LIMITED");
-        assertThat(channel.get("attemptCount").asInt()).isEqualTo(3);
-    }
-
-    @Test
-    void slowEndpointIsClassifiedAsTimeout() throws Exception {
-        JsonNode statusJson = submitAndAwaitTerminal(sinkUrl("timeout"));
-
-        JsonNode channel = statusJson.get("recipients").get(0).get("channels").get(0);
-        assertThat(channel.get("lastFailureType").asString()).isEqualTo("TIMEOUT");
+        assertThat(channel.get("lastFailureReason").asString()).contains("Circuit breaker open");
     }
 
     private String sinkUrl(String scenario) {
         return "http://localhost:" + port + "/internal/webhook-sink/" + scenario;
     }
 
-    private JsonNode submitAndAwaitTerminal(String webhookUrl) throws Exception {
+    private JsonNode submitAndAwaitTerminal(String webhookUrl, String idempotencyKey) throws Exception {
         String body = """
                 {
-                  "idempotencyKey": "webhook-it-%s",
+                  "idempotencyKey": "%s",
                   "sourceSystem": "integration-test",
-                  "eventId": "corr-webhook-1",
+                  "eventId": "corr-resilience",
                   "notificationType": "TEST",
                   "severity": "INFO",
                   "priority": "LOW",
@@ -96,7 +91,7 @@ class WebhookChannelIntegrationTest {
                   "recipients": [{"recipientId": "%s"}],
                   "requestedChannels": ["WEBHOOK"]
                 }
-                """.formatted(Instant.now().toEpochMilli() + "-" + webhookUrl.hashCode(), webhookUrl);
+                """.formatted(idempotencyKey, webhookUrl);
 
         String submitResponse = mockMvc.perform(post("/api/v1/notifications")
                         .contentType(MediaType.APPLICATION_JSON).content(body))

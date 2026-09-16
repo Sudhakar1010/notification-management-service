@@ -52,6 +52,15 @@ public class Notification {
     @Column(name = "idempotency_key", nullable = false)
     private String idempotencyKey;
 
+    /**
+     * SHA-256 fingerprint of the submission's semantic content (see
+     * RequestFingerprint), stored so a later reuse of this notification's
+     * (sourceSystem, idempotencyKey) can be checked for a mismatched
+     * payload rather than blindly treated as a replay. See ADR-014.
+     */
+    @Column(name = "request_fingerprint", nullable = false)
+    private String requestFingerprint;
+
     @Column(name = "notification_type", nullable = false)
     private String notificationType;
 

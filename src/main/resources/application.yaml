@@ -33,6 +33,27 @@ notification:
     retry-max-delay-ms: 30000
     webhook-connect-timeout-ms: 2000
     webhook-read-timeout-ms: 3000
+    webhook:
+      circuit-breaker:
+        failure-rate-threshold: 50
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        wait-duration-in-open-state-seconds: 30
+      retry:
+        max-attempts: 2
+        wait-duration-ms: 200
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+  tracing:
+    sampling:
+      probability: 1.0 # trace every request in this prototype; a real deployment would sample a fraction
 
 logging:
   level:

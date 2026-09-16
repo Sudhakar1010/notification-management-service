@@ -12,6 +12,7 @@ import tools.jackson.databind.ObjectMapper;
 import java.time.Duration;
 import java.time.Instant;
 
+import static com.nms.testsupport.NotificationApiTestHelper.pollUntilTerminal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -58,7 +59,7 @@ class DeliveryRetryIntegrationTest {
                 .andReturn().getResponse().getContentAsString();
         String notificationId = objectMapper.readTree(submitResponse).get("notificationId").asString();
 
-        JsonNode statusJson = pollUntilTerminal(notificationId);
+        JsonNode statusJson = pollUntilTerminal(mockMvc, objectMapper, notificationId, Duration.ofSeconds(8));
 
         assertThat(statusJson.get("overallStatus").asString()).isEqualTo("FAILED");
         JsonNode channel = statusJson.get("recipients").get(0).get("channels").get(0);
@@ -79,21 +80,5 @@ class DeliveryRetryIntegrationTest {
         }
         assertThat(retryScheduledCount).isEqualTo(2);
         assertThat(exhaustedCount).isEqualTo(1);
-    }
-
-    private JsonNode pollUntilTerminal(String notificationId) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(8));
-        JsonNode last = null;
-        while (Instant.now().isBefore(deadline)) {
-            String response = mockMvc.perform(get("/api/v1/notifications/" + notificationId))
-                    .andExpect(status().isOk())
-                    .andReturn().getResponse().getContentAsString();
-            last = objectMapper.readTree(response);
-            if (!last.get("overallStatus").asString().equals("PROCESSING")) {
-                return last;
-            }
-            Thread.sleep(150);
-        }
-        return last;
     }
 }
