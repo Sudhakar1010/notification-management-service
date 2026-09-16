@@ -12,6 +12,7 @@ import tools.jackson.databind.ObjectMapper;
 import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -110,6 +111,16 @@ class NotificationRequestSafetyIntegrationTest {
         assertThat(json.get("error").asString()).isEqualTo("MALFORMED_REQUEST");
         assertThat(json.has("message")).isTrue();
         assertThat(json.has("timestamp")).isTrue();
+    }
+
+    @Test
+    void malformedNotificationIdPathVariableReturnsBadRequestNotServerError() throws Exception {
+        String response = mockMvc.perform(get("/api/v1/notifications/not-a-uuid"))
+                .andExpect(status().isBadRequest())
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode json = objectMapper.readTree(response);
+        assertThat(json.get("error").asString()).isEqualTo("MALFORMED_REQUEST");
     }
 
     @Test

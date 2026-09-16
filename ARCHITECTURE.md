@@ -590,15 +590,21 @@ exercised happy paths and the error paths already deliberately built:
    shape.
 3. No catch-all handler, so any unexpected exception fell through to the
    same framework-default shape as #2.
+4. *(found during a later full-surface re-check)* A malformed
+   `notificationId` path segment (e.g. `GET /notifications/not-a-uuid`)
+   threw an uncaught `MethodArgumentTypeMismatchException` — Spring's
+   `@PathVariable UUID` conversion failure — which fell through to the
+   catch-all and returned `500` instead of a client error.
 
 **Decision:**
 - `NotificationService.validate()` now rejects a duplicated `recipientId`
   with a clear `400` before it reaches the database.
 - `GlobalExceptionHandler` gained `HttpMessageNotReadableException` (→
   `400`), `DataIntegrityViolationException` (→ `409`, defense in depth for
-  any other future unique constraint), and a catch-all `Exception` handler
-  (→ `500`, logged server-side, generic client-facing message). Every
-  handler returns the same `ErrorResponse` shape.
+  any other future unique constraint), `MethodArgumentTypeMismatchException`
+  (→ `400`, gap #4 above), and a catch-all `Exception` handler (→ `500`,
+  logged server-side, generic client-facing message). Every handler
+  returns the same `ErrorResponse` shape.
 
 **Consequences:**
 - \+ One error contract for the whole API.
@@ -1030,11 +1036,11 @@ never exercised.
 | `RoutingPrecedenceIntegrationTest` | Integration | `WARNING`/`CRITICAL` opt-out precedence, `selectedChannels`, zero-eligible-channel case |
 | `SchedulingIntegrationTest` | Integration | `scheduledAt` delays delivery; `expiresAt` produces `SKIPPED` |
 | `NotificationRejectionAuditTest` | Integration | Both rejection paths produce a `NOTIFICATION_REJECTED` audit row |
-| `NotificationRequestSafetyIntegrationTest` | Integration | Duplicate `recipientId` → `400`; idempotency reuse with a different payload → `409`; identical-payload replay still works; malformed JSON/invalid enum → consistent error shape (ADR-014, ADR-015) |
+| `NotificationRequestSafetyIntegrationTest` | Integration | Duplicate `recipientId` → `400`; idempotency reuse with a different payload → `409`; identical-payload replay still works; malformed JSON/invalid enum/malformed path variable → consistent error shape (ADR-014, ADR-015) |
 | `WebhookResilienceIntegrationTest` | Integration (real port) | Fast retry recovers a one-time failure within a single outer attempt; repeated failures open the circuit and block a different, healthy path on the same target authority (ADR-016) |
 | `ApiKeyAuthenticationIntegrationTest` | Integration (`notification.security.enabled=true`) | Missing/invalid key → `401`; valid key + matching `sourceSystem` → `202`; valid key + mismatched `sourceSystem` → `403` (ADR-018) |
 
-**41 tests, 0 failures**, run via `./mvnw test` (`ApiKeyAuthenticationIntegrationTest`
+**42 tests, 0 failures**, run via `./mvnw test` (`ApiKeyAuthenticationIntegrationTest`
 adds 5, proving ADR-018's auth paths with security explicitly enabled for
 that test class only).
 

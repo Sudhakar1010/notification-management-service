@@ -309,7 +309,7 @@ caveat that goes with it).
 ./mvnw test
 ```
 
-41 tests (unit + integration), 0 failures. See ARCHITECTURE.md for the
+42 tests (unit + integration), 0 failures. See ARCHITECTURE.md for the
 full test inventory, testing approach, known limitations, and trade-offs.
 
 ## License
