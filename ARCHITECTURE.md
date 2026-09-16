@@ -1,17 +1,18 @@
 # Architecture
 
 Notification Management Service — architecture overview and Architecture
-Decision Records (ADRs) for the greenfield (Phase 1) build. See `README.md`
-for setup/run instructions.
+Decision Records (ADRs) covering the greenfield (Phase 1) and brownfield
+(Phase 2) builds. See `README.md` for setup/run instructions.
 
 ## 1. System Overview
 
 A Spring Boot 4 / Java 21 service that accepts notification requests from
 upstream systems, decides delivery channels per recipient, dispatches
-delivery attempts asynchronously through simulated provider integrations,
-and exposes status and audit history. Persistence is H2 (in-memory);
-scheduling and persistence are the only infrastructure dependencies — no
-external broker, cache, or message queue.
+delivery attempts asynchronously with bounded retry/backoff, and exposes
+status and audit history. Persistence is H2 (in-memory); scheduling and
+persistence are the only infrastructure dependencies — no external broker,
+cache, or message queue. Email and SMS are simulated; WEBHOOK makes a real
+outbound HTTP call (see ADR-012).
 
 **Components:**
 
@@ -23,8 +24,11 @@ external broker, cache, or message queue.
 | `RoutingService` | `routing` | Decides eligible channels per recipient |
 | `DeliveryQueue` / `DeliveryAttemptQueue` | `delivery` | Port + adapter for enqueuing a delivery attempt |
 | `DeliveryWorker` | `delivery` | `@Scheduled` poller — the async processing loop |
-| `DeliveryAttemptProcessor` | `delivery` | Processes one delivery attempt per transaction |
-| `ChannelProviderRegistry` + `EmailChannelProvider` / `SmsChannelProvider` | `delivery` (+ `.providers`) | Simulated channel adapters |
+| `DeliveryAttemptProcessor` | `delivery` | Processes one delivery attempt per transaction, including retry/backoff decisions |
+| `RetryBackoffPolicy` | `delivery` | Pure function: attempt count → exponential backoff delay |
+| `ChannelProviderRegistry` + `EmailChannelProvider` / `SmsChannelProvider` / `WebhookChannelProvider` | `delivery` (+ `.providers`) | Channel adapters — Email/SMS simulated, Webhook real HTTP |
+| `SimulatedFailureRules` | `delivery.providers` | Shared marker-based outcome rules for the simulated providers |
+| `WebhookSinkController` | `delivery` | Local, non-public stand-in webhook receiver for deterministic demos/tests (see ADR-012) |
 | `AuditService` | `audit` | Records audit trail events |
 
 ## 2. Control Flow
@@ -44,11 +48,15 @@ flowchart TB
     subgraph "Async worker (scheduled, separate thread)"
         DW["DeliveryWorker (poll every 2s)"]
         DAP[DeliveryAttemptProcessor]
+        RBP[RetryBackoffPolicy]
         CPR[ChannelProviderRegistry]
         EP[EmailChannelProvider]
         SP[SmsChannelProvider]
+        WP["WebhookChannelProvider (real HTTP)"]
         AS2[AuditService]
     end
+
+    Sink["WebhookSinkController (local, demo/test only)"]
 
     DB[(H2: notification, notification_recipient,
     delivery_attempt, audit_event,
@@ -64,7 +72,9 @@ flowchart TB
     DW -->|"poll QUEUED / RETRY_SCHEDULED"| DB
     DW --> DAP
     DAP -->|"claim row (optimistic lock)"| DB
-    DAP --> CPR --> EP & SP
+    DAP --> CPR --> EP & SP & WP
+    WP -.->|"real HTTP POST (demo/test target)"| Sink
+    DAP -->|"retryable failure: schedule next attempt"| RBP
     DAP -->|"record outcome"| DB
     DAP --> AS2 --> DB
 
@@ -88,7 +98,8 @@ flowchart TB
 4. `DeliveryWorker` polls for due rows every 2s (configurable), and hands
    each to `DeliveryAttemptProcessor`, which claims the row under optimistic
    locking, calls the resolved `ChannelProvider`, and records the outcome
-   (`DELIVERY_ATTEMPTED` → `DELIVERY_SUCCEEDED`/`DELIVERY_FAILED`).
+   (`DELIVERY_ATTEMPTED` → `DELIVERY_SUCCEEDED` / `RETRY_SCHEDULED` (with
+   backoff, see ADR-011) / `DELIVERY_FAILED` / `DELIVERY_EXHAUSTED`).
 5. `GET /notifications/{id}` derives the overall status live from the
    `DeliveryAttempt` rows (see ADR-004) rather than trusting a
    separately-maintained flag.
@@ -103,7 +114,7 @@ com/nms/
 ├── delivery/     async delivery outbox, worker, providers (+ providers/)
 ├── audit/        audit trail
 ├── exception/    cross-cutting error handling
-└── config/       scheduling configuration
+└── config/       scheduling + webhook HTTP client configuration
 ```
 
 Packages are organized **by business capability** (`notification`,
@@ -358,18 +369,132 @@ identical practical outcome.
 
 ---
 
-### Planned ADRs (reserved numbers, already referenced in code comments)
+### ADR-009 — Extract shared failure-simulation logic out of the providers
+**Status:** Accepted (Phase 2 — Brownfield)
 
-These are intentionally **not yet decided** — the code has forward
-references to them so the eventual decision has an obvious home.
+**Context:** `EmailChannelProvider` and `SmsChannelProvider` each contained
+an identical if/else chain matching markers in `recipientId` to a
+`FailureType` — flagged in Phase 1 as deliberate duplication reserved for
+this refactor, since adding a third provider (`WEBHOOK`) on top of two
+already-duplicated copies would make a third.
 
-- **ADR-009** (Phase 2 — Brownfield): extract the failure-simulation logic
-  duplicated between `EmailChannelProvider` and `SmsChannelProvider` into a
-  shared component before adding the third (`WEBHOOK`) provider.
-  Referenced today in `SmsChannelProvider`'s Javadoc.
-- **ADR-010** (Phase 3 — Ambiguous Requirement): channel routing precedence
-  when requested channel, severity, recipient preference, and routing
-  policy conflict — the requirement (4.3) lists these as inputs without
-  defining precedence. Referenced today in `RoutingService`'s Javadoc,
-  which is deliberately left at its Phase-1 (opt-out-only) behavior pending
-  this decision.
+**Decision:** Extracted the shared rules into
+`SimulatedFailureRules.evaluate(recipientId, channelLabel)`; both providers
+now call it instead of repeating the chain. `WebhookChannelProvider` does
+**not** use it — it classifies from real HTTP outcomes instead (ADR-012),
+which is the point: only genuinely duplicated *simulation* logic was
+extracted, not forced into providers whose failure detection is real.
+
+**Consequences:**
+- \+ One place to add a new simulated marker/failure type instead of two.
+- \+ Behavior-preserving — verified via the existing provider-backed
+  integration tests before and after the extraction.
+- − `SimulatedFailureRules` is prototype-only scaffolding; it has no place
+  in a production build once real provider integrations replace the mocks.
+
+---
+
+### ADR-010 — Channel routing precedence (Planned — Phase 3, Ambiguous Requirement)
+
+**Status:** Not yet decided. Requirement 4.3 lists requested channel,
+severity, recipient preference, and routing policy as routing inputs
+without defining how conflicts between them resolve (e.g. can a `CRITICAL`
+notification override an opt-out?). `RoutingService` is deliberately left
+at its Phase-1 behavior (opt-out filtering only) pending this decision —
+see its Javadoc.
+
+---
+
+### ADR-011 — Bounded retry with exponential backoff
+**Status:** Accepted (Phase 2 — Brownfield)
+
+**Context:** Requirement 4.5 requires a bounded retry strategy for
+retryable delivery failures, distinguishing transient failures from
+permanent ones. Phase 1 deliberately shipped single-shot delivery (every
+failure was terminal) to keep the brownfield diff meaningful.
+
+**Decision:** `DeliveryAttemptProcessor` now branches on
+`FailureType#isRetryable()` (true for `TRANSIENT_PROVIDER_ERROR`,
+`RATE_LIMITED`, `TIMEOUT`; false for `INVALID_RECIPIENT`,
+`PERMANENT_PROVIDER_REJECTION`, `AUTH_ERROR`): a retryable failure with
+attempts remaining reuses the *same* `DeliveryAttempt` row, moving it to
+`RETRY_SCHEDULED` with `nextAttemptAt` pushed out by
+`RetryBackoffPolicy.nextDelay(attemptCount)` — exponential
+(`base * 2^(attemptCount-1)`, capped at `maxDelay`, both configurable). A
+retryable failure with no attempts remaining moves to `EXHAUSTED`; a
+non-retryable failure moves straight to `FAILED`.
+
+**Alternatives considered:**
+- *Fixed retry delay* — simpler, rejected because it doesn't back off
+  under sustained provider trouble (e.g. an extended rate-limit window),
+  which is exactly when backoff matters most.
+- *Retry all failure types* — rejected: retrying `INVALID_RECIPIENT` or
+  `PERMANENT_PROVIDER_REJECTION` can't ever succeed and just wastes worker
+  cycles and delays the terminal audit signal.
+
+**Consequences:**
+- \+ Retries never create a second `DeliveryAttempt` row — the existing
+  delivery-level dedup boundary (ADR-003) applies to retries automatically,
+  no new mechanism needed.
+- \+ `RetryBackoffPolicy` is a pure, directly unit-tested function
+  (`RetryBackoffPolicyTest`); `DeliveryRetryIntegrationTest` proves the
+  full loop end-to-end (2 retries, exponential delays visible in the audit
+  trail, `EXHAUSTED` after `maxAttempts`).
+- − `maxAttempts` (3) and backoff bounds are global configuration, not
+  per-notification-severity — a `CRITICAL` alert retries on the same
+  schedule as an `INFO` one. Acceptable for this prototype; a production
+  system might vary retry budget by severity.
+
+---
+
+### ADR-012 — Webhook channel: `recipientId` as target URL, real HTTP-driven classification
+**Status:** Accepted (Phase 2 — Brownfield)
+
+**Context:** Adding a third channel needed to be a genuine multi-layer
+change, not a fourth copy of the marker-based simulation (see the earlier
+webhook-vs-push discussion). No real Email/SMS-style external account is
+needed for a webhook — it's just an outbound HTTP call — so this channel
+can be implemented for real.
+
+**Decision:**
+- For `WEBHOOK`, `recipientId` is interpreted as the **target URL**
+  itself, not an address to look up — a deliberate departure from
+  EMAIL/SMS's semantics, made explicit in `WebhookChannelProvider`'s
+  Javadoc and the README.
+- `WebhookChannelProvider` makes a real `RestClient` POST (via
+  `WebhookClientConfig`'s configurable connect/read timeouts) and
+  classifies the outcome from the **actual** HTTP response: `401`/`403` →
+  `AUTH_ERROR`, `404`/`410` → `INVALID_RECIPIENT`, `429` → `RATE_LIMITED`,
+  other `4xx` → `PERMANENT_PROVIDER_REJECTION`, `5xx` →
+  `TRANSIENT_PROVIDER_ERROR`, a read/connect timeout → `TIMEOUT`.
+- `WebhookSinkController` (`/internal/webhook-sink/{scenario}`) is a
+  **local, non-public** stand-in receiver so this real HTTP path can be
+  demoed and tested deterministically without depending on an external
+  service being reachable from a grading/CI sandbox. It is explicitly
+  documented (Javadoc + README) as demo/test-only — `WebhookChannelProvider`
+  itself has no dependency on it and works unmodified against any real
+  http(s) URL.
+
+**Alternatives considered:**
+- *Simulated webhook provider (marker-based, like Email/SMS)* — rejected:
+  would add a channel with zero new engineering substance over copy-pasting
+  SMS's shape (see the earlier webhook-vs-push-notification discussion for
+  the full reasoning).
+- *No local sink, require a real external URL for every demo/test* —
+  rejected: makes the webhook path flaky/unusable offline and in CI; the
+  sink keeps the *provider* real while keeping the *target* deterministic.
+
+**Consequences:**
+- \+ Genuinely exercises HTTP-status-driven failure classification, not a
+  simulated stand-in for it — the most realistic channel in the system.
+- \+ `WebhookChannelIntegrationTest` runs against the embedded server's
+  real random port (`@SpringBootTest(webEnvironment = RANDOM_PORT)`),
+  proving success, `404`→`INVALID_RECIPIENT`, `429`→retry→`EXHAUSTED`, and
+  a real client-side timeout — all over an actual socket, not a mock.
+- − `WebhookSinkController` is test/demo scaffolding shipped in `main`
+  (not `test`) source so it's reachable at runtime for live demos; it's
+  clearly marked non-public and would be deleted (or gated behind a
+  profile) before any real deployment.
+- − No outbound URL allow-listing/SSRF protection — acceptable for a
+  prototype where the caller is a trusted upstream system, called out
+  explicitly as a production hardening gap.

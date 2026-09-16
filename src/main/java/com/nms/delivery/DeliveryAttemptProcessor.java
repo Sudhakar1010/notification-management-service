@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -21,7 +22,10 @@ import java.util.UUID;
  * is made -- if another poller thread already claimed the row, the flush
  * below throws and this call is a no-op, satisfying the "reprocessing a
  * queued delivery must not create uncontrolled duplicate side effects"
- * requirement.
+ * requirement. A retryable failure (see FailureType#isRetryable) reuses
+ * this same row for its next attempt via RETRY_SCHEDULED -- retries never
+ * create a second DeliveryAttempt row -- until maxAttempts is reached, at
+ * which point the row moves to EXHAUSTED. See ARCHITECTURE.md ADR-011.
  */
 @Service
 public class DeliveryAttemptProcessor {
@@ -30,15 +34,18 @@ public class DeliveryAttemptProcessor {
     private final NotificationRepository notificationRepository;
     private final ChannelProviderRegistry providerRegistry;
     private final AuditService auditService;
+    private final RetryBackoffPolicy retryBackoffPolicy;
 
     public DeliveryAttemptProcessor(DeliveryAttemptRepository deliveryAttemptRepository,
                                      NotificationRepository notificationRepository,
                                      ChannelProviderRegistry providerRegistry,
-                                     AuditService auditService) {
+                                     AuditService auditService,
+                                     RetryBackoffPolicy retryBackoffPolicy) {
         this.deliveryAttemptRepository = deliveryAttemptRepository;
         this.notificationRepository = notificationRepository;
         this.providerRegistry = providerRegistry;
         this.auditService = auditService;
+        this.retryBackoffPolicy = retryBackoffPolicy;
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -106,11 +113,30 @@ public class DeliveryAttemptProcessor {
         } else {
             attempt.setLastFailureType(result.failureType());
             attempt.setLastFailureReason(result.message());
-            // Phase 1: single-shot delivery -- bounded retry/backoff is wired in Phase 2 (brownfield).
-            attempt.setStatus(DeliveryStatus.FAILED);
-            auditService.record(notification.getId(), AuditEventType.DELIVERY_FAILED,
-                    "recipient=%s, channel=%s, failureType=%s, reason=%s"
-                            .formatted(attempt.getRecipientId(), attempt.getChannel(), result.failureType(), result.message()));
+
+            boolean retryable = result.failureType().isRetryable();
+            boolean attemptsRemaining = attempt.getAttemptCount() < attempt.getMaxAttempts();
+
+            if (retryable && attemptsRemaining) {
+                Duration delay = retryBackoffPolicy.nextDelay(attempt.getAttemptCount());
+                attempt.setStatus(DeliveryStatus.RETRY_SCHEDULED);
+                attempt.setNextAttemptAt(Instant.now().plus(delay));
+                auditService.record(notification.getId(), AuditEventType.RETRY_SCHEDULED,
+                        "recipient=%s, channel=%s, failureType=%s, nextAttemptInMs=%d, attempt=%d/%d"
+                                .formatted(attempt.getRecipientId(), attempt.getChannel(), result.failureType(),
+                                        delay.toMillis(), attempt.getAttemptCount(), attempt.getMaxAttempts()));
+            } else if (retryable) {
+                attempt.setStatus(DeliveryStatus.EXHAUSTED);
+                auditService.record(notification.getId(), AuditEventType.DELIVERY_EXHAUSTED,
+                        "recipient=%s, channel=%s, failureType=%s, reason=%s, attempts=%d/%d"
+                                .formatted(attempt.getRecipientId(), attempt.getChannel(), result.failureType(),
+                                        result.message(), attempt.getAttemptCount(), attempt.getMaxAttempts()));
+            } else {
+                attempt.setStatus(DeliveryStatus.FAILED);
+                auditService.record(notification.getId(), AuditEventType.DELIVERY_FAILED,
+                        "recipient=%s, channel=%s, failureType=%s, reason=%s"
+                                .formatted(attempt.getRecipientId(), attempt.getChannel(), result.failureType(), result.message()));
+            }
         }
 
         attempt.setUpdatedAt(Instant.now());

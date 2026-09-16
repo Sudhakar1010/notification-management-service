@@ -2,5 +2,6 @@ package com.nms.common;
 
 public enum Channel {
     EMAIL,
-    SMS
+    SMS,
+    WEBHOOK
 }

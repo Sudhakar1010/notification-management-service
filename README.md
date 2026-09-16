@@ -4,11 +4,17 @@ A Spring Boot service that accepts notification requests from upstream
 systems, routes them to the right channels per recipient, delivers them
 asynchronously, and exposes status and audit history.
 
-**Status:** Phase 1 (Greenfield) is implemented and tested — submission,
-recipient/channel routing, asynchronous processing, delivery attempts,
-status retrieval, deduplication/idempotency, and audit history. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale (ADRs),
-control-flow diagram, and package structure explanation.
+**Status:**
+- **Phase 1 (Greenfield)** — submission, recipient/channel routing,
+  asynchronous processing, delivery attempts, status retrieval,
+  deduplication/idempotency, and audit history.
+- **Phase 2 (Brownfield)** — bounded retry with exponential backoff, a
+  third channel (`WEBHOOK`, a real outbound HTTP call, not a simulation),
+  and an extracted shared component removing the duplicated
+  failure-simulation logic between the Email and SMS providers.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale
+(ADRs), control-flow diagram, and package structure explanation.
 
 ## Tech Stack
 
@@ -20,8 +26,9 @@ control-flow diagram, and package structure explanation.
 
 No external message broker, cache, or third-party provider account is
 required — asynchronous delivery is implemented as a DB-backed outbox
-processed by a `@Scheduled` worker (see ARCHITECTURE.md ADR-002), and
-Email/SMS providers are deterministic in-process simulations (ADR-007).
+processed by a `@Scheduled` worker (see ARCHITECTURE.md ADR-002). Email
+and SMS providers are deterministic in-process simulations (ADR-007);
+the webhook provider makes a real outbound HTTP call (ADR-012).
 
 ## Project Structure
 
@@ -76,7 +83,11 @@ spring:
 
 notification:
   delivery:
-    poll-interval-ms: 2000    # DeliveryWorker poll cadence
+    poll-interval-ms: 2000          # DeliveryWorker poll cadence
+    retry-base-delay-ms: 2000       # first retry delay for a retryable failure
+    retry-max-delay-ms: 30000       # backoff cap
+    webhook-connect-timeout-ms: 2000
+    webhook-read-timeout-ms: 3000
 ```
 
 **H2 console:** `http://localhost:8080/h2-console` — JDBC URL
@@ -98,8 +109,8 @@ POST /api/v1/notifications
 | `priority` | yes | `LOW` \| `MEDIUM` \| `HIGH` \| `URGENT` |
 | `subject` | no | |
 | `message` | yes | |
-| `recipients` | yes | Array of `{ "recipientId": "..." }`, at least one |
-| `requestedChannels` | yes | Array of `EMAIL` \| `SMS`, at least one |
+| `recipients` | yes | Array of `{ "recipientId": "..." }`, at least one. For `WEBHOOK`, `recipientId` is the target URL itself (see ADR-012) |
+| `requestedChannels` | yes | Array of `EMAIL` \| `SMS` \| `WEBHOOK`, at least one |
 | `scheduledAt`, `expiresAt` | no | ISO-8601 instants |
 
 ```bash
@@ -135,8 +146,16 @@ GET /api/v1/notifications/{id}
 ```
 
 Overall status is *derived* live from delivery attempts (ADR-004):
-`PROCESSING` while any attempt is in flight, `DELIVERED` if every attempt
-succeeded, `FAILED` if none did, `PARTIALLY_DELIVERED` for a mix.
+`PROCESSING` while any attempt is in flight (including `RETRY_SCHEDULED`),
+`DELIVERED` if every attempt succeeded, `FAILED` if none did (this
+includes attempts that exhausted their retries — see below),
+`PARTIALLY_DELIVERED` for a mix.
+
+Per-channel `status` can be `QUEUED`, `SENDING`, `SUCCEEDED`,
+`RETRY_SCHEDULED` (a retryable failure — see `nextAttemptAt` — ADR-011),
+`FAILED` (a non-retryable failure, terminal after one try), `EXHAUSTED`
+(a retryable failure that used up all `maxAttempts`), or `SKIPPED` (the
+notification expired before this attempt ran).
 
 ```bash
 curl -s http://localhost:8080/api/v1/notifications/{id}
@@ -184,25 +203,84 @@ curl -s http://localhost:8080/api/v1/notifications/{id}/audit
 | `400 INVALID_REQUEST` | e.g. `expiresAt` before `scheduledAt` / in the past |
 | `404 NOT_FOUND` | Unknown `notificationId` |
 
-## Mock provider simulation rules
+## Provider behavior
 
-No real Email/SMS provider is integrated (see ARCHITECTURE.md ADR-007).
-`EmailChannelProvider`/`SmsChannelProvider` decide the outcome
+### Email / SMS — simulated (ADR-007)
+
+No real Email/SMS provider is integrated. `EmailChannelProvider` and
+`SmsChannelProvider` both delegate to `SimulatedFailureRules`
+(extracted in Phase 2 — ADR-009), which decides the outcome
 deterministically from a substring marker in `recipientId`, so every
 failure path in requirement 4.5 is reproducible on demand:
 
-| Marker in `recipientId` | Result |
-|---|---|
-| *(none of the below)* | `SUCCEEDED` |
-| `invalid-` | `FAILED` — `INVALID_RECIPIENT` |
-| `ratelimit-` | `FAILED` — `RATE_LIMITED` |
-| `timeout-` | `FAILED` — `TIMEOUT` |
-| `authfail-` | `FAILED` — `AUTH_ERROR` |
-| `failtransient-` | `FAILED` — `TRANSIENT_PROVIDER_ERROR` |
-| `failpermanent-` | `FAILED` — `PERMANENT_PROVIDER_REJECTION` |
+| Marker in `recipientId` | Result | Retryable? |
+|---|---|---|
+| *(none of the below)* | `SUCCEEDED` | — |
+| `invalid-` | `INVALID_RECIPIENT` | no |
+| `ratelimit-` | `RATE_LIMITED` | yes |
+| `timeout-` | `TIMEOUT` | yes |
+| `authfail-` | `AUTH_ERROR` | no |
+| `failtransient-` | `TRANSIENT_PROVIDER_ERROR` | yes |
+| `failpermanent-` | `PERMANENT_PROVIDER_REJECTION` | no |
 
 e.g. `{"recipientId": "invalid-bob@example.com"}` always fails with
-`INVALID_RECIPIENT` on every channel.
+`INVALID_RECIPIENT` on every channel. A "Retryable" failure gets picked up
+again by `DeliveryWorker` per `RetryBackoffPolicy` (ADR-011) until
+`maxAttempts` (3) is reached, then moves to `EXHAUSTED`; a non-retryable
+one moves straight to `FAILED`.
+
+### Webhook — real HTTP call (ADR-012)
+
+Unlike Email/SMS, `WebhookChannelProvider` makes a **real** outbound HTTP
+POST and classifies the outcome from the actual response, not a marker:
+
+| Response | Result |
+|---|---|
+| `2xx` | `SUCCEEDED` |
+| `401` / `403` | `AUTH_ERROR` |
+| `404` / `410` | `INVALID_RECIPIENT` |
+| `429` | `RATE_LIMITED` |
+| other `4xx` | `PERMANENT_PROVIDER_REJECTION` |
+| `5xx` | `TRANSIENT_PROVIDER_ERROR` |
+| connect/read timeout | `TIMEOUT` |
+| malformed/non-http(s) `recipientId` | `INVALID_RECIPIENT` |
+
+For `WEBHOOK`, `recipientId` **is the target URL** — any real `http(s)`
+endpoint works. For deterministic local demos/tests without an external
+dependency, `WebhookSinkController` exposes a local, non-public stand-in
+receiver at `/internal/webhook-sink/{scenario}`:
+
+| Scenario | Response |
+|---|---|
+| `ok` | `200` |
+| `rate-limit` | `429` |
+| `server-error` | `500` |
+| `bad-request` | `400` |
+| `unauthorized` | `401` |
+| `not-found` | `404` |
+| `timeout` | sleeps 1s (triggers a real client read-timeout with the default 3s config) |
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/notifications \
+  -H "Content-Type: application/json" \
+  -d '{
+    "idempotencyKey": "webhook-demo-1",
+    "sourceSystem": "ops-monitor",
+    "eventId": "corr-wh-1",
+    "notificationType": "SERVICE_DOWN",
+    "severity": "CRITICAL",
+    "priority": "URGENT",
+    "message": "payments-service is down",
+    "recipients": [{"recipientId": "http://localhost:8080/internal/webhook-sink/ok"}],
+    "requestedChannels": ["WEBHOOK"]
+  }'
+```
+
+`WebhookSinkController` is scaffolding for this prototype, not part of the
+public API — it exists purely so the real HTTP path can be demonstrated
+and tested without depending on an external service being reachable.
+
+### Recipient preferences (routing)
 
 Demo recipient preferences are seeded in `src/main/resources/data.sql`:
 `alice@example.com` is opted out of `SMS`, `bob@example.com` out of
@@ -219,20 +297,17 @@ routing filter the opted-out channel (audited under `ROUTING_DECIDED`).
 |---|---|---|
 | `RoutingServiceTest` | Unit | Channel selection with/without recipient opt-outs |
 | `NotificationStatusCalculatorTest` | Unit | Overall-status derivation rules (all 6 branches) |
+| `RetryBackoffPolicyTest` | Unit | Exponential backoff math + max-delay cap |
 | `NotificationFlowIntegrationTest` | Integration (`@SpringBootTest` + `MockMvc`) | Full submit → async worker → `DELIVERED` status; idempotent replay creates no second notification |
+| `DeliveryRetryIntegrationTest` | Integration | Retryable failure → 2x `RETRY_SCHEDULED` → `EXHAUSTED`, verified via both the status API and the audit trail |
+| `WebhookChannelIntegrationTest` | Integration (`webEnvironment = RANDOM_PORT`) | Webhook success, `404`→`INVALID_RECIPIENT` (no retry), `429`→retries→`EXHAUSTED`, slow endpoint→`TIMEOUT` — all against a real HTTP call on the embedded server's actual port |
 
-The integration test overrides `notification.delivery.poll-interval-ms` to
-`200` so it doesn't wait on the production 2s cadence.
+Integration tests override `notification.delivery.poll-interval-ms` and
+the retry-delay properties to small values so they don't wait on
+production cadences.
 
-## Known limitations (Phase 1 scope)
+## Known limitations
 
-- **No retry/backoff yet** — a failed delivery attempt is marked `FAILED`
-  after a single try; bounded retry with backoff is Phase 2 scope.
-- **Two channels only** (`EMAIL`, `SMS`) — a third channel (`WEBHOOK`) is
-  Phase 2 scope.
-- **Provider failure-simulation logic is duplicated** between
-  `EmailChannelProvider` and `SmsChannelProvider` — intentional, flagged
-  as the Phase 2 refactor target (ADR-009).
 - **Routing precedence is undecided** — severity/policy vs. recipient
   opt-out conflicts aren't resolved yet; current routing only applies
   opt-outs (ADR-010, Phase 3 ambiguous-requirement scenario).
@@ -240,6 +315,15 @@ The integration test overrides `notification.delivery.poll-interval-ms` to
   prototype scale, called out as a production follow-up (ADR-002).
 - **Idempotency key retention is unbounded** — no TTL/archival job yet
   (ADR-003).
+- **Retry policy is global, not severity-aware** — `maxAttempts` and
+  backoff bounds are the same for a `CRITICAL` alert and an `INFO` one
+  (ADR-011).
+- **`WebhookSinkController` is demo/test scaffolding shipped in `main`**,
+  not gated behind a profile — it's clearly marked non-public, but a real
+  deployment would remove or profile-gate it (ADR-012).
+- **No outbound URL allow-listing/SSRF protection** on the webhook
+  provider — acceptable for a prototype where the caller is a trusted
+  upstream system, called out as a production hardening gap (ADR-012).
 
 ## License
 

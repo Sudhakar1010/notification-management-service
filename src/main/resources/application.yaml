@@ -29,6 +29,10 @@ spring:
 notification:
   delivery:
     poll-interval-ms: 2000
+    retry-base-delay-ms: 2000
+    retry-max-delay-ms: 30000
+    webhook-connect-timeout-ms: 2000
+    webhook-read-timeout-ms: 3000
 
 logging:
   level:

@@ -55,13 +55,13 @@ class NotificationFlowIntegrationTest {
                 .andReturn().getResponse().getContentAsString();
 
         JsonNode submitJson = objectMapper.readTree(submitResponse);
-        assertThat(submitJson.get("status").asText()).isEqualTo("ROUTED");
-        String notificationId = submitJson.get("notificationId").asText();
+        assertThat(submitJson.get("status").asString()).isEqualTo("ROUTED");
+        String notificationId = submitJson.get("notificationId").asString();
 
         JsonNode statusJson = pollUntilTerminal(notificationId);
 
-        assertThat(statusJson.get("overallStatus").asText()).isEqualTo("DELIVERED");
-        assertThat(statusJson.get("recipients").get(0).get("channels").get(0).get("status").asText())
+        assertThat(statusJson.get("overallStatus").asString()).isEqualTo("DELIVERED");
+        assertThat(statusJson.get("recipients").get(0).get("channels").get(0).get("status").asString())
                 .isEqualTo("SUCCEEDED");
     }
 
@@ -86,7 +86,7 @@ class NotificationFlowIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isAccepted())
                 .andReturn().getResponse().getContentAsString();
-        String firstId = objectMapper.readTree(first).get("notificationId").asText();
+        String firstId = objectMapper.readTree(first).get("notificationId").asString();
 
         String second = mockMvc.perform(post("/api/v1/notifications")
                         .contentType(MediaType.APPLICATION_JSON).content(body))
@@ -95,7 +95,7 @@ class NotificationFlowIntegrationTest {
         JsonNode secondJson = objectMapper.readTree(second);
 
         assertThat(secondJson.get("duplicate").asBoolean()).isTrue();
-        assertThat(secondJson.get("notificationId").asText()).isEqualTo(firstId);
+        assertThat(secondJson.get("notificationId").asString()).isEqualTo(firstId);
     }
 
     private JsonNode pollUntilTerminal(String notificationId) throws Exception {
@@ -106,7 +106,7 @@ class NotificationFlowIntegrationTest {
                     .andExpect(status().isOk())
                     .andReturn().getResponse().getContentAsString();
             last = objectMapper.readTree(response);
-            if (!last.get("overallStatus").asText().equals("PROCESSING")) {
+            if (!last.get("overallStatus").asString().equals("PROCESSING")) {
                 return last;
             }
             Thread.sleep(150);
