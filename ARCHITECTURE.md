@@ -1,8 +1,9 @@
 # Architecture
 
 Notification Management Service — architecture overview and Architecture
-Decision Records (ADRs) covering the greenfield (Phase 1) and brownfield
-(Phase 2) builds. See `README.md` for setup/run instructions.
+Decision Records (ADRs) covering the greenfield (Phase 1), brownfield
+(Phase 2), and ambiguous-requirement (Phase 3) builds. See `README.md`
+for setup/run instructions.
 
 ## 1. System Overview
 
@@ -394,14 +395,71 @@ extracted, not forced into providers whose failure detection is real.
 
 ---
 
-### ADR-010 — Channel routing precedence (Planned — Phase 3, Ambiguous Requirement)
+### ADR-010 — Channel routing precedence
+**Status:** Accepted (Phase 3 — Ambiguous Requirement)
 
-**Status:** Not yet decided. Requirement 4.3 lists requested channel,
-severity, recipient preference, and routing policy as routing inputs
-without defining how conflicts between them resolve (e.g. can a `CRITICAL`
-notification override an opt-out?). `RoutingService` is deliberately left
-at its Phase-1 behavior (opt-out filtering only) pending this decision —
-see its Javadoc.
+**Context:** Requirement 4.3 lists requested channel, severity, recipient
+preference, and routing policy as routing inputs without defining how
+conflicts between them resolve. This is the requirement's genuinely
+ambiguous part — the inputs are well-defined, their precedence is not.
+
+**Interpretations considered:**
+1. *Recipient preference is absolute* — an opt-out can never be overridden.
+   Simplest and most privacy-respecting, but means a `CRITICAL`
+   "trading system is down" alert can be silently dropped because a
+   recipient opted out of SMS months ago, unrelated to this specific
+   incident.
+2. *Severity overrides preference for `CRITICAL`* (chosen) — mirrors how
+   real incident-alerting tools (PagerDuty/Opsgenie-style escalation)
+   treat informational notifications differently from P1 pages: routine
+   notifications respect stated preference, but a `CRITICAL` alert reaches
+   every requested channel regardless.
+3. *Fully configurable routing policy* (a policy table per source system
+   or notification type) — most "production-shaped," but disproportionate
+   scope: it's a new entity, a new admin surface, and arguably just moves
+   the ambiguity into "what does the policy config look like," rather than
+   resolving it.
+
+**Decision:** Option 2. `RoutingService.decide(...)` now takes `severity`;
+when `severity == CRITICAL`, the recipient's channel opt-outs are ignored
+and every requested channel is selected. Any other severity keeps the
+Phase-1 behavior (opt-outs respected) unchanged. `priority` is
+deliberately **not** part of this rule — 4.3 names severity as a routing
+input, not priority, so the override isn't extended past what was
+actually specified. The override is stated explicitly in `RoutingDecision`'s
+`reason` (and therefore in the `ROUTING_DECIDED` audit event) whenever it
+fires, so "we overrode this recipient's stated preference" is always a
+visible, queryable fact, not a silent side effect.
+
+This rule **is** the "routing policy" 4.3 asks for — made an explicit,
+named, documented policy rather than left unaddressed.
+
+**Consequences:**
+- \+ A `CRITICAL` alert can't be silently dropped by a stale, unrelated
+  opt-out — directly addresses the interpretation-1 failure mode.
+- \+ The override is always audit-visible, satisfying 4.9's spirit even
+  for a consent-bypassing decision.
+- \+ Verified end-to-end (`RoutingPrecedenceIntegrationTest`): a `WARNING`
+  notification to an opted-out recipient still skips that channel; a
+  `CRITICAL` one to the same recipient still reaches it, with the audit
+  trail recording why.
+- − **Removes a recipient's ability to suppress even a hard opt-out once
+  severity is `CRITICAL`.** This is a genuine consent/compliance trade-off,
+  not a hidden one — a regulated real deployment (e.g. an SMS opt-out
+  driven by a legal STOP request) would need a *separate*, non-overridable
+  "hard opt-out" distinct from this preference-style opt-out, which this
+  prototype does not model.
+- − **`severity` is caller-supplied with no authentication on who is
+  submitting it** (see "Production Readiness Backlog" below). This rule
+  is only safe to rely on once the source system asserting `CRITICAL` is
+  itself verified — right now, nothing stops any caller from declaring
+  every notification `CRITICAL` to bypass every recipient's preferences.
+  This is a real gap, deliberately not fixed as part of Phase 3, which is
+  scoped to the routing-precedence question specifically.
+- − Binary/global, not tiered — a real escalation-policy system (per the
+  rejected option 3) would likely want graduated behavior (e.g. try the
+  preferred channel first, escalate to a forced channel after N minutes)
+  rather than an immediate blanket override.
 
 ---
 
@@ -498,3 +556,40 @@ can be implemented for real.
 - − No outbound URL allow-listing/SSRF protection — acceptable for a
   prototype where the caller is a trusted upstream system, called out
   explicitly as a production hardening gap.
+
+## 5. Production Readiness Backlog
+
+A deliberate architecture review against production standards, done
+before Phase 3, so these gaps are on record rather than discovered later.
+Nothing here is fixed yet — the plan is to revisit this list once all
+three scenarios are complete, and address what's still worth doing then.
+Each item notes why it matters and what closing it would look like.
+
+### Critical
+
+| Gap | Why it matters | Close it by |
+|---|---|---|
+| No authentication/authorization on the API | `sourceSystem` is a self-asserted string; the dedup boundary (ADR-003), audit trail, and now the CRITICAL routing override (ADR-010) all trust it with no verification of caller identity | Authenticate the caller (API key, mTLS, or OAuth2 client-credentials per source system) and derive `sourceSystem` from the verified identity, not the request body |
+| `severity` is unauthenticated and drives a consent-bypassing decision | Since ADR-010, any caller can declare `CRITICAL` and bypass every recipient's channel opt-outs — there is currently nothing stopping abuse of this | Same fix as above; the routing override should only be trusted once the caller declaring `CRITICAL` is itself verified |
+| No schema migration tool (Flyway/Liquibase) | `ddl-auto: create-drop` regenerates the schema from JPA annotations on every boot — no repeatable, reviewable, versioned schema history | Introduce Flyway (or Liquibase), generate an initial baseline migration from the current entities, switch `ddl-auto` to `validate` |
+
+### High
+
+| Gap | Why it matters | Close it by |
+|---|---|---|
+| Sequential, single-threaded delivery processing | `DeliveryWorker.poll()` processes due attempts one at a time with no executor; a slow provider call (up to the configured timeout) blocks every other due attempt behind it in that tick | Dispatch each attempt via a bounded `@Async` executor (or `ThreadPoolTaskScheduler` with >1 pool size) so attempts process concurrently within a node |
+| No circuit breaker on the outbound webhook call | A consistently-failing target gets hit again on every retry with no breaker to stop hammering it | Wrap `WebhookChannelProvider`'s call with Resilience4j's circuit breaker, keyed by target host |
+| No observability stack | No Actuator (`/health`, `/readiness`, `/liveness`, metrics), no distributed tracing — can't follow one notification across submit → route → queue → worker → provider in a trace view | Add `spring-boot-starter-actuator`; add Micrometer Tracing / OpenTelemetry with the notification ID propagated as a trace attribute |
+
+### Medium
+
+| Gap | Why it matters | Close it by |
+|---|---|---|
+| No OpenAPI/Swagger contract | The API reference in `README.md` is hand-written and not guaranteed to match the code | Add `springdoc-openapi-starter-webmvc-ui` |
+| Blanket `DEBUG` logging for the whole package | `logging.level.com.nms: DEBUG` is fine for local dev, but a production profile should default narrower so a future log line can't casually leak content | Add a `prod` profile with `INFO` (or higher) as the package default |
+| No concurrency test proving the optimistic-lock claim | ADR-002/ADR-006 assert that two concurrent claims on the same `DeliveryAttempt` row can't both succeed, but no test actually exercises two threads racing on one row | Add a test that fires two concurrent `DeliveryAttemptProcessor.process()` calls at the same attempt ID and asserts exactly one succeeds |
+
+### Low (worth naming, not planned)
+
+- **No secrets management story** — moot today since providers are mocked/local and H2 has no real password, but a real Email/SMS/webhook credential shouldn't live in `application.yaml`.
+- **No CORS/CSRF posture defined** — there's no Spring Security dependency at all, so this is "wide open by omission," not a deliberate choice; would need to be decided alongside the authentication work above.

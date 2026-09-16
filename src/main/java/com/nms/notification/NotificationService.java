@@ -114,7 +114,8 @@ public class NotificationService {
         Instant firstAttemptAt = notification.getScheduledAt() != null ? notification.getScheduledAt() : Instant.now();
 
         for (NotificationRecipient recipient : notification.getRecipients()) {
-            RoutingDecision decision = routingService.decide(recipient.getRecipientId(), notification.getRequestedChannels());
+            RoutingDecision decision = routingService.decide(recipient.getRecipientId(),
+                    notification.getRequestedChannels(), notification.getSeverity());
             auditService.record(notification.getId(), AuditEventType.ROUTING_DECIDED,
                     "recipient=%s, %s".formatted(recipient.getRecipientId(), decision.reason()));
 

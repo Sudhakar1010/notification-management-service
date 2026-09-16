@@ -1,6 +1,7 @@
 package com.nms.routing;
 
 import com.nms.common.Channel;
+import com.nms.common.Severity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -22,7 +23,7 @@ class RoutingServiceTest {
         when(preferenceRepository.findByRecipientId("alice")).thenReturn(List.of());
         RoutingService service = new RoutingService(preferenceRepository);
 
-        RoutingDecision decision = service.decide("alice", List.of(Channel.EMAIL, Channel.SMS));
+        RoutingDecision decision = service.decide("alice", List.of(Channel.EMAIL, Channel.SMS), Severity.INFO);
 
         assertThat(decision.selectedChannels()).containsExactly(Channel.EMAIL, Channel.SMS);
         assertThat(decision.isRoutable()).isTrue();
@@ -37,7 +38,7 @@ class RoutingServiceTest {
         when(preferenceRepository.findByRecipientId("bob")).thenReturn(List.of(optOut));
         RoutingService service = new RoutingService(preferenceRepository);
 
-        RoutingDecision decision = service.decide("bob", List.of(Channel.EMAIL, Channel.SMS));
+        RoutingDecision decision = service.decide("bob", List.of(Channel.EMAIL, Channel.SMS), Severity.WARNING);
 
         assertThat(decision.selectedChannels()).containsExactly(Channel.EMAIL);
     }
@@ -51,9 +52,35 @@ class RoutingServiceTest {
         when(preferenceRepository.findByRecipientId("carol")).thenReturn(List.of(optOut));
         RoutingService service = new RoutingService(preferenceRepository);
 
-        RoutingDecision decision = service.decide("carol", List.of(Channel.EMAIL));
+        RoutingDecision decision = service.decide("carol", List.of(Channel.EMAIL), Severity.WARNING);
 
         assertThat(decision.isRoutable()).isFalse();
         assertThat(decision.selectedChannels()).isEmpty();
+    }
+
+    @Test
+    void criticalSeverityOverridesRecipientOptOut() {
+        RecipientPreference optOut = new RecipientPreference();
+        optOut.setRecipientId("dana");
+        optOut.setChannel(Channel.SMS);
+        optOut.setOptedIn(false);
+        when(preferenceRepository.findByRecipientId("dana")).thenReturn(List.of(optOut));
+        RoutingService service = new RoutingService(preferenceRepository);
+
+        RoutingDecision decision = service.decide("dana", List.of(Channel.EMAIL, Channel.SMS), Severity.CRITICAL);
+
+        assertThat(decision.selectedChannels()).containsExactly(Channel.EMAIL, Channel.SMS);
+        assertThat(decision.reason()).contains("severity=CRITICAL overrides opt-out");
+    }
+
+    @Test
+    void criticalSeverityWithNoOptOutsBehavesLikeNormalRouting() {
+        when(preferenceRepository.findByRecipientId("erin")).thenReturn(List.of());
+        RoutingService service = new RoutingService(preferenceRepository);
+
+        RoutingDecision decision = service.decide("erin", List.of(Channel.EMAIL), Severity.CRITICAL);
+
+        assertThat(decision.selectedChannels()).containsExactly(Channel.EMAIL);
+        assertThat(decision.reason()).doesNotContain("overrides opt-out");
     }
 }

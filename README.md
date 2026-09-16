@@ -12,6 +12,10 @@ asynchronously, and exposes status and audit history.
   third channel (`WEBHOOK`, a real outbound HTTP call, not a simulation),
   and an extracted shared component removing the duplicated
   failure-simulation logic between the Email and SMS providers.
+- **Phase 3 (Ambiguous Requirement)** — resolved the undefined channel
+  routing precedence between requested channel, severity, and recipient
+  preference: a `CRITICAL` notification now overrides a recipient's
+  channel opt-outs; anything else still respects them.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale
 (ADRs), control-flow diagram, and package structure explanation.
@@ -280,12 +284,24 @@ curl -s -X POST http://localhost:8080/api/v1/notifications \
 public API — it exists purely so the real HTTP path can be demonstrated
 and tested without depending on an external service being reachable.
 
-### Recipient preferences (routing)
+### Recipient preferences & routing precedence (ADR-010)
 
 Demo recipient preferences are seeded in `src/main/resources/data.sql`:
 `alice@example.com` is opted out of `SMS`, `bob@example.com` out of
-`EMAIL` — submit a request with both channels requested for either to see
-routing filter the opted-out channel (audited under `ROUTING_DECIDED`).
+`EMAIL`.
+
+- Any severity **below** `CRITICAL` respects the opt-out — submit a
+  `WARNING` notification to `alice@example.com` requesting `EMAIL` +
+  `SMS`, and only `EMAIL` is routed (audited under `ROUTING_DECIDED`).
+- A `CRITICAL` notification **overrides** the opt-out — the same request
+  with `"severity": "CRITICAL"` reaches `alice@example.com` on both
+  `EMAIL` and `SMS`, and the audit entry says so explicitly
+  (`...severity=CRITICAL overrides opt-out...`).
+
+⚠️ `severity` is caller-supplied with no authentication behind it in this
+prototype — see `ARCHITECTURE.md`'s Production Readiness Backlog. This
+rule is only safe to rely on in a real deployment once the caller
+asserting `CRITICAL` is itself verified.
 
 ## Testing
 
@@ -295,12 +311,13 @@ routing filter the opted-out channel (audited under `ROUTING_DECIDED`).
 
 | Test | Type | Covers |
 |---|---|---|
-| `RoutingServiceTest` | Unit | Channel selection with/without recipient opt-outs |
+| `RoutingServiceTest` | Unit | Channel selection with/without recipient opt-outs, plus `CRITICAL` override (5 cases) |
 | `NotificationStatusCalculatorTest` | Unit | Overall-status derivation rules (all 6 branches) |
 | `RetryBackoffPolicyTest` | Unit | Exponential backoff math + max-delay cap |
 | `NotificationFlowIntegrationTest` | Integration (`@SpringBootTest` + `MockMvc`) | Full submit → async worker → `DELIVERED` status; idempotent replay creates no second notification |
 | `DeliveryRetryIntegrationTest` | Integration | Retryable failure → 2x `RETRY_SCHEDULED` → `EXHAUSTED`, verified via both the status API and the audit trail |
 | `WebhookChannelIntegrationTest` | Integration (`webEnvironment = RANDOM_PORT`) | Webhook success, `404`→`INVALID_RECIPIENT` (no retry), `429`→retries→`EXHAUSTED`, slow endpoint→`TIMEOUT` — all against a real HTTP call on the embedded server's actual port |
+| `RoutingPrecedenceIntegrationTest` | Integration | End-to-end: `WARNING` to an opted-out recipient skips the channel; `CRITICAL` to the same recipient still reaches it, with the override visible in the audit trail |
 
 Integration tests override `notification.delivery.poll-interval-ms` and
 the retry-delay properties to small values so they don't wait on
@@ -308,11 +325,20 @@ production cadences.
 
 ## Known limitations
 
-- **Routing precedence is undecided** — severity/policy vs. recipient
-  opt-out conflicts aren't resolved yet; current routing only applies
-  opt-outs (ADR-010, Phase 3 ambiguous-requirement scenario).
-- **Single-node delivery worker** — no `SKIP LOCKED`/partitioning; fine at
-  prototype scale, called out as a production follow-up (ADR-002).
+- **`severity` is caller-supplied with no authentication** — since ADR-010,
+  a `CRITICAL` claim bypasses recipient opt-outs, and nothing currently
+  verifies who's asserting it. See the Production Readiness Backlog below.
+- **Routing override is binary, not a graduated escalation policy** — a
+  real system might try the preferred channel first and escalate to a
+  forced channel after N minutes, rather than an immediate blanket
+  override (ADR-010).
+- **No distinction between a "soft" preference and a "hard," legally
+  binding opt-out** (e.g. an SMS `STOP` request) — `CRITICAL` currently
+  overrides both the same way (ADR-010).
+- **Single-node delivery worker**, processed sequentially — no
+  `SKIP LOCKED`/partitioning across nodes, and no concurrency within a
+  node either; fine at prototype scale (ADR-002, Production Readiness
+  Backlog).
 - **Idempotency key retention is unbounded** — no TTL/archival job yet
   (ADR-003).
 - **Retry policy is global, not severity-aware** — `maxAttempts` and
@@ -324,6 +350,11 @@ production cadences.
 - **No outbound URL allow-listing/SSRF protection** on the webhook
   provider — acceptable for a prototype where the caller is a trusted
   upstream system, called out as a production hardening gap (ADR-012).
+
+See `ARCHITECTURE.md`'s **Production Readiness Backlog** for the full,
+severity-ranked list (including authentication, schema migrations,
+observability, and circuit breakers) — deliberately not fixed as part of
+these three scenarios, reviewed as a batch once all phases are complete.
 
 ## License
 
