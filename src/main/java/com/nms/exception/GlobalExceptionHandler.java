@@ -66,6 +66,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse("IDEMPOTENCY_KEY_CONFLICT", ex.getMessage()));
     }
 
+    @ExceptionHandler(SourceSystemMismatchException.class)
+    public ResponseEntity<ErrorResponse> handleSourceSystemMismatch(SourceSystemMismatchException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(new ErrorResponse("SOURCE_SYSTEM_MISMATCH", ex.getMessage()));
+    }
+
     @ExceptionHandler(NotificationNotFoundException.class)
     public ResponseEntity<ErrorResponse> handleNotFound(NotificationNotFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)

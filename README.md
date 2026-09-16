@@ -14,6 +14,7 @@ trade-offs, and the Production Readiness Backlog.
 - Spring Boot 4.1.1 (Web MVC, Data JPA, Validation, Actuator)
 - Resilience4j (circuit breaker + retry, webhook channel only)
 - Micrometer Tracing + OpenTelemetry (logging exporter — no collector required)
+- Flyway (baseline migration present, currently shipped disabled — see ARCHITECTURE.md ADR-019)
 - H2 in-memory database
 - Lombok
 - Maven Wrapper
@@ -95,6 +96,21 @@ management:
 **Tracing:** every HTTP request is traced automatically; each async
 delivery attempt gets its own span (tagged with notification id, channel,
 attempt number, outcome), printed to the log via `LoggingSpanExporter`.
+
+**Authentication (opt-in, off by default):** set
+`notification.security.enabled=true` to require an `X-Api-Key` header on
+`/api/v1/notifications/**`. Demo keys are seeded in `application.yaml`
+(`notification.security.api-keys`). A valid key whose mapped
+`sourceSystem` doesn't match the request body's `sourceSystem` field is
+rejected with `403`. See ARCHITECTURE.md ADR-018 for why this defaults
+off and what enabling it in production actually requires.
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/notifications \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: demo-trading-alerts-key" \
+  -d '{ ... "sourceSystem": "trading-alerts", ... }'
+```
 
 ## API Reference
 
@@ -207,6 +223,8 @@ Every error response shares one shape:
 | `400 VALIDATION_FAILED` | Missing/invalid request fields |
 | `400 INVALID_REQUEST` | e.g. `expiresAt` before `scheduledAt`/in the past, duplicate `recipientId` |
 | `400 MALFORMED_REQUEST` | Unparseable JSON, or an invalid enum value |
+| `401 UNAUTHORIZED` | Missing/invalid `X-Api-Key` (only when `notification.security.enabled=true`) |
+| `403 SOURCE_SYSTEM_MISMATCH` | Authenticated API key's `sourceSystem` doesn't match the request body |
 | `404 NOT_FOUND` | Unknown `notificationId` |
 | `409 IDEMPOTENCY_KEY_CONFLICT` | Same `(sourceSystem, idempotencyKey)` reused with a different payload |
 | `409 DATA_CONFLICT` | Defense-in-depth for any other data conflict |
@@ -284,7 +302,7 @@ caveat that goes with it).
 ./mvnw test
 ```
 
-36 tests (unit + integration), 0 failures. See ARCHITECTURE.md for the
+41 tests (unit + integration), 0 failures. See ARCHITECTURE.md for the
 full test inventory, testing approach, known limitations, and trade-offs.
 
 ## License

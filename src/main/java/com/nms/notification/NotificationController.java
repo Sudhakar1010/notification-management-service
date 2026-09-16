@@ -1,9 +1,12 @@
 package com.nms.notification;
 
+import com.nms.exception.SourceSystemMismatchException;
 import com.nms.notification.dto.AuditEventView;
 import com.nms.notification.dto.NotificationRequest;
 import com.nms.notification.dto.NotificationResponse;
 import com.nms.notification.dto.NotificationStatusResponse;
+import com.nms.security.ApiKeyAuthenticationFilter;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -28,7 +31,16 @@ public class NotificationController {
     }
 
     @PostMapping
-    public ResponseEntity<NotificationResponse> submit(@Valid @RequestBody NotificationRequest request) {
+    public ResponseEntity<NotificationResponse> submit(@Valid @RequestBody NotificationRequest request,
+                                                         HttpServletRequest httpRequest) {
+        Object authenticatedSourceSystem = httpRequest.getAttribute(
+                ApiKeyAuthenticationFilter.AUTHENTICATED_SOURCE_SYSTEM_ATTR);
+        if (authenticatedSourceSystem != null && !authenticatedSourceSystem.equals(request.sourceSystem())) {
+            throw new SourceSystemMismatchException(
+                    "Authenticated caller does not match sourceSystem '%s' in the request body"
+                            .formatted(request.sourceSystem()));
+        }
+
         NotificationResponse response = notificationService.submit(request);
         HttpStatus status = response.duplicate() ? HttpStatus.OK : HttpStatus.ACCEPTED;
         return ResponseEntity.status(status).body(response);

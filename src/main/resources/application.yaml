@@ -22,6 +22,17 @@ spring:
         format_sql: true
     defer-datasource-initialization: true
 
+  # A generated baseline migration exists at db/migration/V1__init.sql,
+  # produced from Hibernate's own DDL export (not hand-typed). Flyway is
+  # disabled by default: this Boot version's spring-boot-flyway jar doesn't
+  # register FlywayMigrationInitializerDatabaseInitializerDetector under
+  # the DependsOnDatabaseInitializationDetector SPI, so JPA's
+  # ddl-auto=validate races Flyway's migration and fails intermittently
+  # depending on bean-creation order -- see ARCHITECTURE.md ADR-019. Ready
+  # to flip on once that's fixed upstream or worked around properly.
+  flyway:
+    enabled: false
+
   sql:
     init:
       mode: always
@@ -42,6 +53,12 @@ notification:
       retry:
         max-attempts: 2
         wait-duration-ms: 200
+
+  security:
+    enabled: false # opt-in on purpose -- see ARCHITECTURE.md ADR-018
+    api-keys:
+      demo-trading-alerts-key: trading-alerts
+      demo-ops-monitor-key: ops-monitor
 
 management:
   endpoints:

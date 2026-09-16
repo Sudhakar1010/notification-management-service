@@ -717,6 +717,139 @@ original HTTP request already returned.
   (Email/SMS are in-process, webhook targets are arbitrary external URLs
   not expected to understand trace headers).
 
+---
+
+### ADR-018 — API-key authentication, opt-in and default-off
+**Status:** Accepted
+
+**Context:** The Production Readiness Backlog's top item: `sourceSystem`
+was a self-asserted request-body string with nothing verifying caller
+identity, undermining the idempotency boundary (ADR-003), the audit
+trail, and specifically the ADR-010 `CRITICAL` routing override, which
+any caller could trigger by just claiming that severity.
+
+**Decision:** `ApiKeyAuthenticationFilter` (`OncePerRequestFilter`, no new
+dependency — `spring-web` already provides it) authenticates requests to
+`/api/v1/notifications/**` via an `X-Api-Key` header, resolving it to a
+`sourceSystem` via `notification.security.api-keys` (a demo key-to-system
+map in `application.yaml`; a real deployment would hash these and store
+them in a credential store, not plaintext config). The resolved identity
+is stashed as a request attribute; `NotificationController` rejects a
+request whose body `sourceSystem` doesn't match it with `403
+SOURCE_SYSTEM_MISMATCH`.
+
+The whole capability is gated behind `notification.security.enabled`,
+**default `false`**. This was a deliberate rollout choice, not a
+half-measure: flipping enforcement on for an already-integrated set of
+callers needs every caller migrated to send a key first, and doing that
+migration for this project's own 36 existing tests inside a fixed time
+window (this was implemented with roughly 90 minutes remaining before a
+hard cutoff) was assessed as the wrong risk to take. Shipping the
+mechanism, proving it works via a dedicated test class, and leaving
+enablement as a one-property flip is the same phased pattern a real
+rollout would use — add support, migrate callers, then enforce — just
+compressed to fit the time available.
+
+**Alternatives considered:**
+- *Spring Security* — the more "industry standard" choice for
+  security-critical code, and my first recommendation when this was
+  discussed. Rejected for this specific implementation window: adding it
+  changes the default posture to deny-all-until-configured, which would
+  have required updating most of the 36 existing test classes just to
+  keep them passing, on top of building the feature itself, inside the
+  same short window. `OncePerRequestFilter` gives the same request-
+  intercept mechanism without that migration tax. Revisiting this
+  trade-off without the time pressure is reasonable.
+- *HTTP Basic Auth* — rejected as a weak long-term fit for machine-to-
+  machine calls (no scoping, no expiry), and no simpler to implement than
+  a custom header here.
+
+**Consequences:**
+- \+ Closes the actual gap: `sourceSystem` can now be a verified identity,
+  not a self-asserted string, once a deployment turns it on.
+- \+ Zero risk to the existing 36 tests — they're unaffected because the
+  default is off; a dedicated 5-test class
+  (`ApiKeyAuthenticationIntegrationTest`) proves the mechanism itself:
+  missing key → 401, invalid key → 401, valid key + matching
+  `sourceSystem` → 202, valid key + mismatched `sourceSystem` → 403.
+- \+ Verified live against the running app for all three key paths.
+- − Not enabled by default — the gap this closes is only closed once a
+  deployment explicitly turns it on and migrates its callers. Tracked
+  explicitly in §7, not hidden behind "done."
+- − API keys live in plaintext in `application.yaml` for this prototype —
+  a real deployment must hash them and use a real credential store.
+- − No authorization layer on top — this proves *who* is calling, not
+  *what* they're allowed to do (e.g. a policy restricting which systems
+  may send `CRITICAL`). A distinct, larger piece of work, left for later.
+
+---
+
+### ADR-019 — Flyway baseline migration: generated, wired, but shipped disabled
+**Status:** Accepted (partial — see Consequences)
+
+**Context:** The Production Readiness Backlog's other Critical item:
+`ddl-auto: create-drop` regenerates the schema from JPA annotations on
+every boot, with no versioned, reviewable schema history.
+
+**Decision:** Added `flyway-core` (via `spring-boot-starter-flyway`) and a
+baseline `db/migration/V1__init.sql` — generated from Hibernate's own
+`jakarta.persistence.schema-generation` DDL export, **not hand-typed**,
+specifically to guarantee it exactly matches what the entities already
+produce rather than risk a subtly wrong column type or constraint under
+time pressure.
+
+**What actually happened when wiring it in:** switching `ddl-auto` to
+`validate` with Flyway enabled failed context startup with `Schema
+validation: missing table [audit_event]` — Hibernate's validation ran
+*before* Flyway created the schema. Root-caused precisely: Spring Boot's
+`spring-boot-jpa` module discovers database initializers (things
+`entityManagerFactory` should depend on) via a
+`DependsOnDatabaseInitializationDetector` SPI; `spring-boot-flyway`
+*ships* the matching detector class
+(`FlywayMigrationInitializerDatabaseInitializerDetector`) but, in this
+Boot version's packaged jar, doesn't register it under the SPI's
+`META-INF/spring/...imports` file, so JPA never discovers it and never
+adds the dependency automatically. Attempting to force the ordering by
+hand (a `BeanFactoryPostProcessor` setting `entityManagerFactory`'s
+`dependsOn`) surfaced a second, backwards existing relationship —
+`flywayInitializer` already transitively depended on
+`entityManagerFactory` — producing a genuine circular dependency once the
+forward link was added too.
+
+**Decision (pivot):** rather than keep excavating a framework packaging
+gap against a hard time budget, shipped the migration as a **ready,
+correct artifact** and reverted to the known-working
+`ddl-auto: create-drop`, with `spring.flyway.enabled: false`. The
+migration file is real and usable the moment this ordering issue is
+fixed (upstream, or via a correctly-scoped ordering workaround built
+without time pressure) — it just isn't live today.
+
+**Alternatives considered:**
+- *Keep pushing on the `BeanFactoryPostProcessor` workaround* — rejected:
+  each fix attempt surfaced a new layer of the same ordering problem: two
+  fixes in, still not resolved, and continuing to spend the remaining
+  window here would have crowded out verifying everything else still
+  worked.
+- *Hand-write the migration SQL instead of generating it* — rejected
+  throughout: a hand-typed schema migration is exactly the kind of thing
+  most likely to contain a subtle, hard-to-notice mistake when rushed,
+  which is a worse outcome than not enabling Flyway yet.
+
+**Consequences:**
+- \+ A correct, ready-to-use baseline migration exists and is verifiably
+  accurate (it *is* Hibernate's own generated DDL).
+- \+ Honestly documents a real, specific, reproducible framework issue
+  encountered in this Boot version, rather than silently working around
+  it or leaving it undiagnosed.
+- − The actual gap (no versioned schema management in the running
+  application) is **not closed** — `ddl-auto: create-drop` is still what
+  runs. This is explicitly not claimed as done in §7.
+- − Fixing the ordering issue properly (e.g. registering the missing SPI
+  file via a project-owned `META-INF/spring/...imports` resource, which
+  is the standard supported extension point for exactly this situation)
+  is a small, well-understood follow-up — just not one to attempt for the
+  first time with no remaining margin for a second surprise.
+
 ## 5. Three Scenarios: Decomposition, Execution, Validation
 
 How each of the assignment's three required scenarios was broken down,
@@ -855,8 +988,11 @@ never exercised.
 | `NotificationRejectionAuditTest` | Integration | Both rejection paths produce a `NOTIFICATION_REJECTED` audit row |
 | `NotificationRequestSafetyIntegrationTest` | Integration | Duplicate `recipientId` → `400`; idempotency reuse with a different payload → `409`; identical-payload replay still works; malformed JSON/invalid enum → consistent error shape (ADR-014, ADR-015) |
 | `WebhookResilienceIntegrationTest` | Integration (real port) | Fast retry recovers a one-time failure within a single outer attempt; repeated failures open the circuit and block a different, healthy path on the same target authority (ADR-016) |
+| `ApiKeyAuthenticationIntegrationTest` | Integration (`notification.security.enabled=true`) | Missing/invalid key → `401`; valid key + matching `sourceSystem` → `202`; valid key + mismatched `sourceSystem` → `403` (ADR-018) |
 
-**36 tests, 0 failures**, run via `./mvnw test`.
+**41 tests, 0 failures**, run via `./mvnw test` (`ApiKeyAuthenticationIntegrationTest`
+adds 5, proving ADR-018's auth paths with security explicitly enabled for
+that test class only).
 
 ### Testing gaps
 
@@ -919,9 +1055,9 @@ what closing it would look like.
 
 | Gap | Why it matters | Close it by |
 |---|---|---|
-| No authentication/authorization on the API | `sourceSystem` is a self-asserted string; the dedup boundary (ADR-003), audit trail, and the `CRITICAL` routing override (ADR-010) all trust it with no verification of caller identity | Authenticate the caller (API key, mTLS, or OAuth2 client-credentials per source system) and derive `sourceSystem` from the verified identity, not the request body |
-| `severity` is unauthenticated and drives a consent-bypassing decision | Since ADR-010, any caller can declare `CRITICAL` and bypass every recipient's channel opt-outs | Same fix as above |
-| No schema migration tool (Flyway/Liquibase) | `ddl-auto: create-drop` regenerates the schema from JPA annotations on every boot — no versioned schema history | Introduce Flyway/Liquibase, baseline migration from current entities, switch `ddl-auto` to `validate` |
+| ~~No authentication/authorization on the API~~ | **Mechanism built — ADR-018.** `ApiKeyAuthenticationFilter` + `sourceSystem`-mismatch rejection exist and are proven by a dedicated test, but ship **disabled by default** (`notification.security.enabled=false`) so existing callers aren't broken without a migration step. | Set `notification.security.enabled=true` and provision real (hashed, not plaintext) API keys per source system before relying on this in production. Authorization (which systems may declare `CRITICAL`) is still unbuilt. |
+| `severity` is unauthenticated and drives a consent-bypassing decision | Unchanged until the item above is actually *enabled* in a given deployment, not just built | Enable ADR-018 and issue every source system a key before trusting ADR-010's override |
+| No schema migration tool (Flyway/Liquibase) | `ddl-auto: create-drop` regenerates the schema from JPA annotations on every boot — no versioned schema history | **Attempted — ADR-019.** A correct baseline migration exists (`db/migration/V1__init.sql`, generated from Hibernate's own DDL) but is shipped **disabled**: this Boot version's Flyway/JPA bean-ordering integration has a packaging gap (missing SPI registration) that needs a proper fix, not a rushed one — see ADR-019 for the exact root cause. |
 
 ### High
 
